@@ -68,10 +68,23 @@ pub fn inject_token(
     refresh_token: &str,
     expiry: i64,
     email: &str,
-    is_gcp_tos: bool,
+    mut is_gcp_tos: bool,
     project_id: Option<&str>,
+    id_token: Option<&str>,
+    oauth_client_key: Option<&str>,
 ) -> Result<String, String> {
     crate::modules::logger::log_info("Starting Token injection...");
+    
+    // 如果使用的是本项目的内置 Client ID (antigravity_enterprise 实际上是标准版)
+    // 则强制关闭 GCP TOS 标志，以确保 IDE 使用标准 Client ID 进行刷新
+    if let Some(key) = oauth_client_key {
+        if key == "antigravity_enterprise" {
+            if is_gcp_tos {
+                crate::modules::logger::log_info("[DB] Built-in client detected, forcing Standard mode for injection.");
+                is_gcp_tos = false;
+            }
+        }
+    }
     
     // 1. Detect Antigravity version
     let version_result = crate::modules::version::get_antigravity_version();
@@ -97,6 +110,7 @@ pub fn inject_token(
                     email,
                     is_gcp_tos,
                     project_id,
+                    id_token,
                 )
             } else {
                 // < 1.16.5: Use old format only
@@ -122,6 +136,7 @@ pub fn inject_token(
                 email,
                 is_gcp_tos,
                 project_id,
+                id_token,
             );
             
             // Try old format
@@ -150,11 +165,19 @@ fn inject_new_format(
     email: &str,
     is_gcp_tos: bool,
     project_id: Option<&str>,
+    id_token: Option<&str>,
 ) -> Result<String, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
     
     // Create OAuthTokenInfo (binary)
-    let oauth_info = protobuf::create_oauth_info(access_token, refresh_token, expiry, is_gcp_tos);
+    let oauth_info = protobuf::create_oauth_info(
+        access_token,
+        refresh_token,
+        expiry,
+        is_gcp_tos,
+        id_token,
+        Some(email),
+    );
     let outer_b64 = protobuf::create_unified_state_entry("oauthTokenInfoSentinelKey", &oauth_info);
     
     conn.execute(
@@ -283,4 +306,22 @@ fn inject_old_format(
     .map_err(|e| format!("Failed to write onboarding flag: {}", e))?;
     
     Ok("Token injection successful (old format)".to_string())
+}
+
+/// 注入 Service Machine ID 到数据库，解决 VS Code 缓存指纹不匹配导致 Token 失效的问题
+pub fn write_service_machine_id(db_path: &std::path::Path, service_machine_id: &str) -> Result<(), String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
+    
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+        ["telemetry.serviceMachineId", service_machine_id],
+    )
+    .map_err(|e| format!("Failed to write serviceMachineId: {}", e))?;
+
+    crate::modules::logger::log_info(&format!(
+        "Successfully injected serviceMachineId: {}",
+        service_machine_id
+    ));
+    
+    Ok(())
 }

@@ -76,6 +76,7 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
             ),
         );
         
@@ -1057,10 +1058,13 @@ async fn ensure_enterprise_project_ready(account: &mut Account) -> Result<(), St
             save_account(account)?;
             Ok(())
         }
-        Err(e) => Err(format!(
-            "Account {} cannot be switched safely: missing enterprise project_id and auto-resolve failed ({}). Please re-auth with a non-enterprise OAuth client or provide a valid project-enabled token.",
-            account.email, e
-        )),
+        Err(e) => {
+            crate::modules::logger::log_warn(&format!(
+                "Account {} is currently missing enterprise project_id and auto-resolve failed ({}). Allowing switch to proceed, but certain enterprise features may be limited.",
+                account.email, e
+            ));
+            Ok(())
+        }
     }
 }
 
@@ -1726,6 +1730,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                     account.token.project_id.clone(), // Keep original project_id
                     None,                             // Add None as session_id
                     account.token.is_gcp_tos,
+                    token_res.id_token.clone(),
                 )
                 .with_oauth_client_key(
                     token_res

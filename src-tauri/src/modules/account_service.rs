@@ -35,7 +35,8 @@ impl AccountService {
             Some(user_info.email.clone()),
             project_id,
             None,
-            true,
+            false, // 个人账号默认不开启 GCP TOS
+            token_res.id_token.clone(),
         )
         .with_oauth_client_key(token_res.oauth_client_key.clone());
 
@@ -165,7 +166,8 @@ impl AccountService {
             Some(user_info.email.clone()),
             project_id,
             None,
-            true,
+            false, // 默认不开启，由后续逻辑或用户手动调整
+            token_res.id_token,
         )
         .with_oauth_client_key(token_res.oauth_client_key.clone());
 
