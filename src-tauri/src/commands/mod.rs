@@ -1,5 +1,6 @@
 use crate::models::{Account, AppConfig, QuotaData};
 use crate::modules;
+use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -118,12 +119,15 @@ pub async fn switch_account(
     app: tauri::AppHandle,
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     account_id: String,
+    target_ide: Option<String>,
 ) -> Result<(), String> {
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app.clone()),
     );
 
-    service.switch_account(&account_id).await?;
+    service
+        .switch_account(&account_id, target_ide.as_deref())
+        .await?;
 
     // 同步托盘
     crate::modules::tray::update_tray_menus(&app);
@@ -395,7 +399,10 @@ pub async fn save_config(
 // --- OAuth 命令 ---
 
 #[tauri::command]
-pub async fn start_oauth_login(app_handle: tauri::AppHandle, oauth_client_key: Option<String>) -> Result<Account, String> {
+pub async fn start_oauth_login(
+    app_handle: tauri::AppHandle,
+    oauth_client_key: Option<String>,
+) -> Result<Account, String> {
     modules::logger::log_info("开始 OAuth 授权流程...");
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app_handle.clone()),
@@ -439,7 +446,10 @@ pub async fn complete_oauth_login(app_handle: tauri::AppHandle) -> Result<Accoun
 
 /// 预生成 OAuth 授权链接 (不打开浏览器)
 #[tauri::command]
-pub async fn prepare_oauth_url(app_handle: tauri::AppHandle, oauth_client_key: Option<String>) -> Result<String, String> {
+pub async fn prepare_oauth_url(
+    app_handle: tauri::AppHandle,
+    oauth_client_key: Option<String>,
+) -> Result<String, String> {
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app_handle.clone()),
     );
@@ -460,7 +470,8 @@ pub async fn submit_oauth_code(code: String, state: Option<String>) -> Result<()
 }
 
 #[tauri::command]
-pub async fn list_oauth_clients() -> Result<Vec<crate::modules::oauth::OAuthClientDescriptor>, String> {
+pub async fn list_oauth_clients(
+) -> Result<Vec<crate::modules::oauth::OAuthClientDescriptor>, String> {
     crate::modules::oauth::list_oauth_clients()
 }
 
@@ -581,13 +592,27 @@ pub async fn sync_account_from_db(
     Ok(Some(account))
 }
 
-fn validate_path(path: &str) -> Result<(), String> {
-    if path.contains("..") {
-        return Err("非法路径: 不允许目录遍历".to_string());
+fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .map_err(|e| format!("failed_to_resolve_path: {}", e));
     }
 
-    // 检查是否指向系统敏感路径 (基础黑名单)
-    let lower_path = path.to_lowercase();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "invalid_path: missing parent directory".to_string())?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("failed_to_resolve_parent: {}", e))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "invalid_path: missing file name".to_string())?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn is_sensitive_path(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
     let sensitive_prefixes = [
         "/etc/",
         "/var/spool/cron",
@@ -596,30 +621,62 @@ fn validate_path(path: &str) -> Result<(), String> {
         "/sys/",
         "/dev/",
         "c:\\windows",
+        "c:\\program files",
+        "c:\\program files (x86)",
         "c:\\users\\administrator",
         "c:\\pagefile.sys",
     ];
 
-    for prefix in sensitive_prefixes {
-        if lower_path.starts_with(prefix) {
-            return Err(format!("安全拒绝: 禁止访问系统敏感路径 ({})", prefix));
+    sensitive_prefixes
+        .iter()
+        .any(|prefix| lower == *prefix || lower.starts_with(prefix))
+}
+
+fn validate_user_json_path(path: &str, must_exist: bool) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(path);
+    if requested.as_os_str().is_empty() {
+        return Err("invalid_path: empty path".to_string());
+    }
+    if !requested.is_absolute() {
+        return Err("invalid_path: absolute path is required".to_string());
+    }
+
+    let resolved = resolve_existing_or_parent(&requested)?;
+    if is_sensitive_path(&resolved) {
+        return Err("security_denied: sensitive system path is not allowed".to_string());
+    }
+
+    let is_json = resolved
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Err("invalid_path: only .json files are allowed".to_string());
+    }
+
+    if must_exist {
+        let metadata = std::fs::metadata(&resolved)
+            .map_err(|e| format!("failed_to_read_file_metadata: {}", e))?;
+        if !metadata.is_file() {
+            return Err("invalid_path: expected a regular file".to_string());
         }
     }
 
-    Ok(())
+    Ok(resolved)
 }
 
 /// 保存文本文件 (绕过前端 Scope 限制)
 #[tauri::command]
 pub async fn save_text_file(path: String, content: String) -> Result<(), String> {
-    validate_path(&path)?;
+    let path = validate_user_json_path(&path, false)?;
     std::fs::write(&path, content).map_err(|e| format!("写入文件失败: {}", e))
 }
 
 /// 读取文本文件 (绕过前端 Scope 限制)
 #[tauri::command]
 pub async fn read_text_file(path: String) -> Result<String, String> {
-    validate_path(&path)?;
+    let path = validate_user_json_path(&path, true)?;
     std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))
 }
 
@@ -721,7 +778,7 @@ pub async fn get_antigravity_path(bypass_config: Option<bool>) -> Result<String,
     }
 
     // 2. 执行实时探测
-    match crate::modules::process::get_antigravity_executable_path() {
+    match crate::modules::process::get_antigravity_executable_path(None) {
         Some(path) => Ok(path.to_string_lossy().to_string()),
         None => Err("未找到 Antigravity 安装路径".to_string()),
     }
@@ -730,7 +787,7 @@ pub async fn get_antigravity_path(bypass_config: Option<bool>) -> Result<String,
 /// 获取 Antigravity 启动参数
 #[tauri::command]
 pub async fn get_antigravity_args() -> Result<Vec<String>, String> {
-    match crate::modules::process::get_args_from_running_process() {
+    match crate::modules::process::get_args_from_running_process(None) {
         Some(args) => Ok(args),
         None => Err("未找到正在运行的 Antigravity 进程".to_string()),
     }
@@ -759,7 +816,6 @@ pub async fn update_last_check_time() -> Result<(), String> {
     crate::modules::update_checker::update_last_check_time()
 }
 
-
 /// 检测是否通过 Homebrew Cask 安装
 #[tauri::command]
 pub async fn check_homebrew_installation() -> Result<bool, String> {
@@ -772,7 +828,6 @@ pub async fn brew_upgrade_cask() -> Result<String, String> {
     modules::logger::log_info("收到前端触发的 Homebrew 升级请求");
     crate::modules::update_checker::brew_upgrade_cask().await
 }
-
 
 /// 获取更新设置
 #[tauri::command]

@@ -21,9 +21,9 @@ fn get_data_dir() -> Result<PathBuf, String> {
 }
 
 /// Find storage.json path (prefer custom/portable paths)
-pub fn get_storage_path() -> Result<PathBuf, String> {
+pub fn get_storage_path(target_ide: Option<&str>) -> Result<PathBuf, String> {
     // 1) --user-data-dir flag
-    if let Some(user_data_dir) = process::get_user_data_dir_from_process() {
+    if let Some(user_data_dir) = process::get_user_data_dir_from_process(target_ide) {
         let path = user_data_dir
             .join("User")
             .join("globalStorage")
@@ -34,7 +34,7 @@ pub fn get_storage_path() -> Result<PathBuf, String> {
     }
 
     // 2) Portable mode (based on executable data/user-data)
-    if let Some(exe_path) = process::get_antigravity_executable_path() {
+    if let Some(exe_path) = process::get_antigravity_executable_path(target_ide) {
         if let Some(parent) = exe_path.parent() {
             let portable = parent
                 .join("data")
@@ -48,12 +48,20 @@ pub fn get_storage_path() -> Result<PathBuf, String> {
         }
     }
 
+    let folder_name = if target_ide == Some("ide") {
+        "Antigravity IDE"
+    } else {
+        "Antigravity"
+    };
+
     // 3) Standard installation location
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
-        let path =
-            home.join("Library/Application Support/Antigravity/User/globalStorage/storage.json");
+        let path = home.join(format!(
+            "Library/Application Support/{}/User/globalStorage/storage.json",
+            folder_name
+        ));
         if path.exists() {
             return Ok(path);
         }
@@ -63,7 +71,9 @@ pub fn get_storage_path() -> Result<PathBuf, String> {
     {
         let appdata =
             std::env::var("APPDATA").map_err(|_| "failed_to_get_appdata_env".to_string())?;
-        let path = PathBuf::from(appdata).join("Antigravity\\User\\globalStorage\\storage.json");
+        let path = PathBuf::from(appdata)
+            .join(folder_name)
+            .join("User\\globalStorage\\storage.json");
         if path.exists() {
             return Ok(path);
         }
@@ -72,7 +82,10 @@ pub fn get_storage_path() -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
     {
         let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
-        let path = home.join(".config/Antigravity/User/globalStorage/storage.json");
+        let path = home.join(format!(
+            ".config/{}/User/globalStorage/storage.json",
+            folder_name
+        ));
         if path.exists() {
             return Ok(path);
         }
@@ -83,7 +96,7 @@ pub fn get_storage_path() -> Result<PathBuf, String> {
 
 /// Get directory of storage.json
 pub fn get_storage_dir() -> Result<PathBuf, String> {
-    let path = get_storage_path()?;
+    let path = get_storage_path(None)?;
     path.parent()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| "failed_to_get_storage_parent_dir".to_string())
@@ -115,10 +128,10 @@ pub fn backup_storage(storage_path: &Path) -> Result<PathBuf, String> {
 /// Read current device profile from storage.json
 #[allow(dead_code)]
 pub fn read_profile(storage_path: &Path) -> Result<DeviceProfile, String> {
-    let content =
-        fs::read_to_string(storage_path).map_err(|e| format!("read_failed ({:?}): {}", storage_path, e))?;
-    let json: Value =
-        serde_json::from_str(&content).map_err(|e| format!("parse_failed ({:?}): {}", storage_path, e))?;
+    let content = fs::read_to_string(storage_path)
+        .map_err(|e| format!("read_failed ({:?}): {}", storage_path, e))?;
+    let json: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("parse_failed ({:?}): {}", storage_path, e))?;
 
     // Supports nested telemetry or flat telemetry.xxx
     let get_field = |key: &str| -> Option<String> {
@@ -150,8 +163,7 @@ pub fn write_profile(storage_path: &Path, profile: &DeviceProfile) -> Result<(),
         return Err(format!("storage_json_missing: {:?}", storage_path));
     }
 
-    let content =
-        fs::read_to_string(storage_path).map_err(|e| format!("read_failed: {}", e))?;
+    let content = fs::read_to_string(storage_path).map_err(|e| format!("read_failed: {}", e))?;
     let mut json: Value =
         serde_json::from_str(&content).map_err(|e| format!("parse_failed: {}", e))?;
 
@@ -210,9 +222,10 @@ pub fn write_profile(storage_path: &Path, profile: &DeviceProfile) -> Result<(),
         );
     }
 
-    let updated = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("serialize_failed: {}", e))?;
-    fs::write(storage_path, updated).map_err(|e| format!("write_failed ({:?}): {}", storage_path, e))?;
+    let updated =
+        serde_json::to_string_pretty(&json).map_err(|e| format!("serialize_failed: {}", e))?;
+    fs::write(storage_path, updated)
+        .map_err(|e| format!("write_failed ({:?}): {}", storage_path, e))?;
     logger::log_info(&format!("device_profile_written to {:?}", storage_path));
 
     // Sync ItemTable.storage.serviceMachineId in state.vscdb
@@ -223,8 +236,7 @@ pub fn write_profile(storage_path: &Path, profile: &DeviceProfile) -> Result<(),
 /// Only sync serviceMachineId, don't change other fields
 #[allow(dead_code)]
 pub fn sync_service_machine_id(storage_path: &Path, service_id: &str) -> Result<(), String> {
-    let content =
-        fs::read_to_string(storage_path).map_err(|e| format!("read_failed: {}", e))?;
+    let content = fs::read_to_string(storage_path).map_err(|e| format!("read_failed: {}", e))?;
     let mut json: Value =
         serde_json::from_str(&content).map_err(|e| format!("parse_failed: {}", e))?;
 
@@ -235,8 +247,8 @@ pub fn sync_service_machine_id(storage_path: &Path, service_id: &str) -> Result<
         );
     }
 
-    let updated = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("serialize_failed: {}", e))?;
+    let updated =
+        serde_json::to_string_pretty(&json).map_err(|e| format!("serialize_failed: {}", e))?;
     fs::write(storage_path, updated).map_err(|e| format!("write_failed: {}", e))?;
     logger::log_info("service_machine_id_synced");
 
@@ -251,7 +263,8 @@ pub fn sync_service_machine_id_from_storage(storage_path: &Path) -> Result<(), S
         return Err("storage_json_missing".to_string());
     }
     let content = fs::read_to_string(storage_path).map_err(|e| format!("read_failed: {}", e))?;
-    let mut json: Value = serde_json::from_str(&content).map_err(|e| format!("parse_failed: {}", e))?;
+    let mut json: Value =
+        serde_json::from_str(&content).map_err(|e| format!("parse_failed: {}", e))?;
 
     let service_id = json
         .get("storage.serviceMachineId")
@@ -277,13 +290,17 @@ pub fn sync_service_machine_id_from_storage(storage_path: &Path) -> Result<(), S
         .is_none()
     {
         if let Some(map) = json.as_object_mut() {
-            map.insert("storage.serviceMachineId".to_string(), Value::String(service_id.clone()));
+            map.insert(
+                "storage.serviceMachineId".to_string(),
+                Value::String(service_id.clone()),
+            );
             dirty = true;
         }
     }
 
     if dirty {
-        let updated = serde_json::to_string_pretty(&json).map_err(|e| format!("serialize_failed: {}", e))?;
+        let updated =
+            serde_json::to_string_pretty(&json).map_err(|e| format!("serialize_failed: {}", e))?;
         fs::write(storage_path, updated).map_err(|e| format!("write_failed: {}", e))?;
         logger::log_info("service_machine_id_added");
     }
@@ -294,10 +311,7 @@ pub fn sync_service_machine_id_from_storage(storage_path: &Path) -> Result<(), S
 fn sync_state_service_machine_id_value(service_id: &str) -> Result<(), String> {
     let db_path = get_state_db_path()?;
     if !db_path.exists() {
-        logger::log_warn(&format!(
-            "state_db_missing: {:?}",
-            db_path
-        ));
+        logger::log_warn(&format!("state_db_missing: {:?}", db_path));
         return Ok(());
     }
 

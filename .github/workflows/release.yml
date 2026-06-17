@@ -5,6 +5,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-tauri:
     permissions:
@@ -23,7 +26,7 @@ jobs:
             args: ""
           - platform: "ubuntu-24.04-arm"
             args: ""
-          - platform: "windows-latest"
+          - platform: "windows-2025"
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -51,6 +54,22 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm install --legacy-peer-deps
+
+      - name: Disable updater artifacts without signing key
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Host "Updater signing key is configured; keeping updater artifacts enabled."
+            exit 0
+          }
+
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content -Raw $configPath | ConvertFrom-Json
+          $config.bundle.createUpdaterArtifacts = $false
+          $config | ConvertTo-Json -Depth 32 | Set-Content -Path $configPath -Encoding UTF8
+          Write-Host "No updater signing key configured; disabled updater artifacts for this build."
 
       - name: Build the app
         env:
@@ -102,7 +121,7 @@ jobs:
         with:
           name: updater-json-${{ matrix.platform }}-${{ strategy.job-index }}
           path: src-tauri/target/**/release/bundle/updater/*.json
-          if-no-files-found: warn
+          if-no-files-found: ignore
 
       # 2. 上传安装包到 Artifacts (供后续统一发布任务下载)
       - name: Upload Release Artifacts
@@ -236,6 +255,23 @@ jobs:
           echo "Generated updater.json:"
           cat updater.json
 
+      - name: Collect release files
+        run: |
+          mkdir -p release-files
+          find all-artifacts -type f \( \
+            -name "*.dmg" -o \
+            -name "*.deb" -o \
+            -name "*.AppImage" -o \
+            -name "*.msi" -o \
+            -name "*.exe" -o \
+            -name "*.rpm" -o \
+            -name "*.app.tar.gz" -o \
+            -name "*.sig" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp "$file" release-files/
+          done
+          find release-files -maxdepth 1 -type f -print
+
       # 使用 ncipollo/release-action 进行统一发布，支持稳健覆盖
       - name: Create or Update GitHub Release
         uses: ncipollo/release-action@v1
@@ -245,7 +281,7 @@ jobs:
           name: "Antigravity Tools ${{ github.ref_name }}"
           bodyFile: "release_notes.md"
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: "all-artifacts/**/*,updater.json"
+          artifacts: "release-files/*,updater.json"
           artifactErrorsFailBuild: false
           replacesArtifacts: true
           makeLatest: legacy
