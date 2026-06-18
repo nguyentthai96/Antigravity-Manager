@@ -6,13 +6,60 @@ use sysinfo::System;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-fn get_current_exe_path() -> Option<std::path::PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
+/// Check if a process is an Antigravity main process (not a thread/worker).
+///
+/// On Linux, Electron spawns many sub-processes that share the same exe path.
+/// We only want to match the "main" processes — those whose process name
+/// matches the binary name (e.g. "antigravity-ide"), NOT thread workers
+/// whose names are like "ThreadPoolForeg", "libuv-worker", "PerfettoTrace", etc.
+fn is_main_antigravity_process(name: &str, exe_path: &str, args_str: &str, target: &str) -> bool {
+    // Exclude extension/config directory processes
+    if exe_path.contains("/.antigravity-ide/") || exe_path.contains("/.antigravity/") {
+        return false;
+    }
+
+    // Exclude well-known non-Antigravity binaries
+    let binary_name = exe_path.rsplit('/').next().unwrap_or("");
+    if matches!(binary_name, "java" | "node" | "rust-analyzer" | "gopls" | "python" | "python3") {
+        return false;
+    }
+
+    // Exclude helper sub-processes (crashpad, language_server, etc.)
+    if name.contains("crashpad")
+        || name.contains("language_server")
+        || exe_path.contains("crashpad")
+        || exe_path.contains("language_server")
+    {
+        return false;
+    }
+
+    // Exclude Electron sub-process types (identified by --type= arg)
+    if args_str.contains("--type=") {
+        return false;
+    }
+
+    if target == "ide" {
+        // For IDE: the process name must be exactly "antigravity-ide"
+        // This excludes thread workers like "ThreadPoolForeg", "libuv-worker", etc.
+        name == "antigravity-ide"
+            && (exe_path.contains("/antigravity-ide/") || exe_path.ends_with("/antigravity-ide"))
+    } else {
+        // For Classic: process name must be "antigravity" (exact)
+        // and NOT be the IDE variant
+        name == "antigravity"
+            && (exe_path.contains("/antigravity") && !exe_path.contains("antigravity-ide"))
+    }
 }
 
-pub fn is_antigravity_running() -> bool {
+/// Check if a process is our own CLI tool (to exclude from matching)
+fn is_own_cli_process(name: &str, exe_path: &str, args_str: &str) -> bool {
+    name.contains("antigravity-cli")
+        || exe_path.contains("antigravity-cli")
+        || name == "cargo"
+        || args_str.contains("antigravity-cli")
+}
+
+pub fn is_antigravity_running(target: &str) -> bool {
     let mut system = System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All);
 
@@ -37,37 +84,11 @@ pub fn is_antigravity_running() -> bool {
             .collect::<Vec<String>>()
             .join(" ");
 
-        // Prevent matching our own CLI process
-        if name.contains("antigravity-cli") || exe_path.contains("antigravity-cli") || name == "cargo" || args_str.contains("antigravity-cli") {
+        if is_own_cli_process(&name, &exe_path, &args_str) {
             continue;
         }
 
-        let is_helper = args_str.contains("--type=")
-            || name.contains("helper")
-            || name.contains("plugin")
-            || name.contains("renderer")
-            || name.contains("gpu")
-            || name.contains("crashpad")
-            || name.contains("utility")
-            || name.contains("audio")
-            || name.contains("sandbox")
-            || exe_path.contains("crashpad");
-
-        #[cfg(target_os = "macos")]
-        if exe_path.contains("antigravity.app") && !is_helper {
-            return true;
-        }
-
-        #[cfg(target_os = "windows")]
-        if name == "antigravity.exe" && !is_helper {
-            return true;
-        }
-
-        #[cfg(target_os = "linux")]
-        if (name.contains("antigravity") || exe_path.contains("/antigravity"))
-            && !name.contains("tools")
-            && !is_helper
-        {
+        if is_main_antigravity_process(&name, &exe_path, &args_str, target) {
             return true;
         }
     }
@@ -75,11 +96,15 @@ pub fn is_antigravity_running() -> bool {
     false
 }
 
-fn get_antigravity_pids() -> Vec<u32> {
+/// Find PIDs of main Antigravity processes (only main processes, not thread workers)
+fn get_main_pids(target: &str) -> Vec<u32> {
     let mut system = System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All);
     let mut pids = Vec::new();
     let current_pid = std::process::id();
+
+    #[cfg(target_os = "linux")]
+    let family_pids = get_self_family_pids(&system);
 
     for (pid, process) in system.processes() {
         let pid_u32 = pid.as_u32();
@@ -101,55 +126,97 @@ fn get_antigravity_pids() -> Vec<u32> {
             .collect::<Vec<String>>()
             .join(" ");
 
-        // Prevent matching our own CLI process
-        if name.contains("antigravity-cli") || exe_path.contains("antigravity-cli") || name == "cargo" || args_str.contains("antigravity-cli") {
+        if is_own_cli_process(&name, &exe_path, &args_str) {
             continue;
         }
 
-        let is_helper = args_str.contains("--type=")
-            || name.contains("helper")
-            || name.contains("plugin")
-            || name.contains("renderer")
-            || name.contains("gpu")
-            || name.contains("crashpad")
-            || name.contains("utility")
-            || name.contains("audio")
-            || name.contains("sandbox")
-            || exe_path.contains("crashpad");
-
-        #[cfg(target_os = "macos")]
-        if exe_path.contains("antigravity.app") {
-            pids.push(pid_u32);
-        }
-
-        #[cfg(target_os = "windows")]
-        if name == "antigravity.exe" {
-            pids.push(pid_u32);
-        }
-
         #[cfg(target_os = "linux")]
-        if (name == "antigravity" || exe_path.contains("/antigravity")) && !name.contains("tools") {
-            println!("Matched process: PID={}, Name={}, ExePath={}", pid_u32, name, exe_path);
+        {
+            if family_pids.contains(&pid_u32) {
+                continue;
+            }
+        }
+
+        if is_main_antigravity_process(&name, &exe_path, &args_str, target) {
             pids.push(pid_u32);
         }
     }
+
+    if !pids.is_empty() {
+        println!("Found {} main Antigravity process(es):", pids.len());
+        for &pid_u32 in &pids {
+            let pid = sysinfo::Pid::from_u32(pid_u32);
+            if let Some(process) = system.process(pid) {
+                let name = process.name().to_string_lossy();
+                let exe = process.exe().and_then(|p| p.to_str()).unwrap_or("(unknown)");
+                println!("  PID={}, Name={}, Exe={}", pid_u32, name, exe);
+            }
+        }
+    }
+
     pids
 }
 
-pub fn close_antigravity(timeout_secs: u64) -> Result<(), String> {
-    println!("Closing Antigravity...");
-    let pids = get_antigravity_pids();
-    
+#[cfg(target_os = "linux")]
+fn get_self_family_pids(system: &sysinfo::System) -> std::collections::HashSet<u32> {
+    let current_pid = std::process::id();
+    let mut family_pids = std::collections::HashSet::new();
+    family_pids.insert(current_pid);
+
+    let mut next_pid = current_pid;
+    for _ in 0..10 {
+        let pid_val = sysinfo::Pid::from_u32(next_pid);
+        if let Some(process) = system.process(pid_val) {
+            if let Some(parent) = process.parent() {
+                let parent_id = parent.as_u32();
+                if !family_pids.insert(parent_id) {
+                    break;
+                }
+                next_pid = parent_id;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    let mut adj: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for (pid, process) in system.processes() {
+        if let Some(parent) = process.parent() {
+            adj.entry(parent.as_u32()).or_default().push(pid.as_u32());
+        }
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(current_pid);
+    while let Some(pid) = queue.pop_front() {
+        if let Some(children) = adj.get(&pid) {
+            for &child in children {
+                if family_pids.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+
+    family_pids
+}
+
+pub fn close_antigravity(timeout_secs: u64, target: &str) -> Result<(), String> {
+    let label = if target == "ide" { "Antigravity IDE" } else { "Antigravity" };
+    println!("Closing {}...", label);
+
+    let pids = get_main_pids(target);
     if pids.is_empty() {
-        println!("Antigravity is not running.");
+        println!("{} is not running.", label);
         return Ok(());
     }
-    
-    println!("Found PIDs to kill: {:?}", pids);
 
+    // Phase 1: SIGTERM to main processes
     #[cfg(target_os = "windows")]
     {
-        for pid in pids {
+        for pid in &pids {
             let _ = Command::new("taskkill")
                 .args(["/F", "/PID", &pid.to_string()])
                 .creation_flags(0x08000000)
@@ -160,42 +227,67 @@ pub fn close_antigravity(timeout_secs: u64) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         for pid in &pids {
-            println!("Sending SIGTERM to {}", pid);
+            println!("Sending SIGTERM to PID={}", pid);
             let _ = Command::new("kill")
                 .args(["-15", &pid.to_string()])
                 .output();
         }
     }
 
+    // Wait for graceful exit (70% of timeout)
     let graceful_timeout = (timeout_secs * 7) / 10;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(graceful_timeout) {
-        if !is_antigravity_running() {
+        if !is_antigravity_running(target) {
+            println!("{} closed successfully (graceful).", label);
             return Ok(());
         }
         thread::sleep(Duration::from_millis(500));
     }
 
+    // Phase 2: SIGKILL remaining main processes
     #[cfg(not(target_os = "windows"))]
     {
-        let remaining_pids = get_antigravity_pids();
-        for pid in &remaining_pids {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+        let remaining = get_main_pids(target);
+        if !remaining.is_empty() {
+            println!("Graceful exit timeout. Force killing {} remaining main process(es)...", remaining.len());
+            for pid in &remaining {
+                println!("Sending SIGKILL to PID={}", pid);
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+            }
         }
     }
-    
-    thread::sleep(Duration::from_secs(1));
-    if is_antigravity_running() {
-        return Err("Unable to close Antigravity process".to_string());
+
+    // Wait for cleanup (remaining 30% of timeout)
+    let kill_timeout = timeout_secs - graceful_timeout;
+    let start2 = std::time::Instant::now();
+    while start2.elapsed() < Duration::from_secs(kill_timeout.max(3)) {
+        if !is_antigravity_running(target) {
+            println!("{} closed successfully (forced).", label);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(500));
     }
 
+    // Final check
+    if is_antigravity_running(target) {
+        return Err(format!("Unable to close {} process, please close manually and retry", label));
+    }
+
+    println!("{} closed successfully.", label);
     Ok(())
 }
 
-fn get_antigravity_executable_path() -> Option<std::path::PathBuf> {
+fn get_antigravity_executable_path(target: &str) -> Option<std::path::PathBuf> {
+    let folder_name = if target == "ide" {
+        "Antigravity IDE"
+    } else {
+        "Antigravity"
+    };
+
     #[cfg(target_os = "macos")]
     {
-        let path = std::path::PathBuf::from("/Applications/Antigravity.app");
+        let path = std::path::PathBuf::from(format!("/Applications/{}.app", folder_name));
         if path.exists() {
             return Some(path);
         }
@@ -209,10 +301,23 @@ fn get_antigravity_executable_path() -> Option<std::path::PathBuf> {
 
         let mut possible_paths = Vec::new();
         if let Some(local) = local_appdata {
-            possible_paths.push(std::path::PathBuf::from(&local).join("Programs").join("Antigravity").join("Antigravity.exe"));
+            possible_paths.push(
+                std::path::PathBuf::from(&local)
+                    .join("Programs")
+                    .join(folder_name)
+                    .join(format!("{}.exe", folder_name)),
+            );
         }
-        possible_paths.push(std::path::PathBuf::from(&program_files).join("Antigravity").join("Antigravity.exe"));
-        possible_paths.push(std::path::PathBuf::from(&program_files_x86).join("Antigravity").join("Antigravity.exe"));
+        possible_paths.push(
+            std::path::PathBuf::from(&program_files)
+                .join(folder_name)
+                .join(format!("{}.exe", folder_name)),
+        );
+        possible_paths.push(
+            std::path::PathBuf::from(&program_files_x86)
+                .join(folder_name)
+                .join(format!("{}.exe", folder_name)),
+        );
 
         for path in possible_paths {
             if path.exists() {
@@ -223,17 +328,25 @@ fn get_antigravity_executable_path() -> Option<std::path::PathBuf> {
 
     #[cfg(target_os = "linux")]
     {
-        let possible_paths = vec![
-            std::path::PathBuf::from("/usr/bin/antigravity"),
-            std::path::PathBuf::from("/opt/Antigravity/antigravity"),
-        ];
+        let exe_name = if target == "ide" {
+            "antigravity-ide"
+        } else {
+            "antigravity"
+        };
 
         if let Some(home) = dirs::home_dir() {
-            let user_local = home.join(".local/bin/antigravity");
+            let user_local = home.join(format!(".local/bin/{}", exe_name));
             if user_local.exists() {
                 return Some(user_local);
             }
         }
+
+        let possible_paths = vec![
+            std::path::PathBuf::from(format!("/usr/bin/{}", exe_name)),
+            std::path::PathBuf::from(format!("/opt/{}/{}", folder_name, exe_name)),
+            std::path::PathBuf::from(format!("/opt/{}/{}", exe_name, exe_name)),
+            std::path::PathBuf::from(format!("/usr/share/{}/{}", folder_name, exe_name)),
+        ];
 
         for path in possible_paths {
             if path.exists() {
@@ -245,37 +358,49 @@ fn get_antigravity_executable_path() -> Option<std::path::PathBuf> {
     None
 }
 
-pub fn start_antigravity() -> Result<(), String> {
-    println!("Starting Antigravity...");
+pub fn start_antigravity(target: &str) -> Result<(), String> {
+    let label = if target == "ide" { "Antigravity IDE" } else { "Antigravity" };
+    println!("Starting {}...", label);
 
     #[cfg(target_os = "macos")]
     {
+        let app_name = if target == "ide" {
+            "Antigravity IDE"
+        } else {
+            "Antigravity"
+        };
         let output = Command::new("open")
-            .args(["-a", "Antigravity"])
+            .args(["-a", app_name])
             .output()
             .map_err(|e| format!("Unable to execute open command: {}", e))?;
 
         if !output.status.success() {
             return Err(format!("Startup failed: {}", String::from_utf8_lossy(&output.stderr)));
         }
+        println!("{} started successfully (macOS open).", label);
+        return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
-        let mut cmd = Command::new("cmd");
+        let path = get_antigravity_executable_path(target)
+            .ok_or(format!("Cannot find {} executable", label))?;
+        let mut cmd = Command::new(&path);
         cmd.creation_flags(0x08000000);
-        cmd.args(["/C", "start", "antigravity://"]);
-        let result = cmd.spawn();
-        if result.is_err() {
-            return Err("Startup failed".to_string());
-        }
+        cmd.spawn().map_err(|e| format!("Startup failed: {}", e))?;
+        println!("{} started successfully.", label);
+        return Ok(());
     }
 
     #[cfg(target_os = "linux")]
     {
-        let path = get_antigravity_executable_path().ok_or("Cannot find Antigravity executable")?;
-        let _ = Command::new(path).spawn().map_err(|e| format!("Startup failed: {}", e))?;
+        let path = get_antigravity_executable_path(target)
+            .ok_or(format!("Cannot find {} executable", label))?;
+        println!("Found executable: {:?}", path);
+        let _ = Command::new(&path)
+            .spawn()
+            .map_err(|e| format!("Startup failed: {}", e))?;
+        println!("{} started successfully.", label);
+        return Ok(());
     }
-
-    Ok(())
 }

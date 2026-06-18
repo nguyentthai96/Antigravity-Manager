@@ -19,14 +19,14 @@ grep '"email"' antigravity_accounts.json
 ```
 
 Current accounts in your file:
-- thaint1@vnpay.vn
+- thaint1@nttco.vn
 - pphstory@gmail.com
 - phamhoang20092000@gmail.com
-- hoangpp@vnpay.vn
-- thinhdp@vnpay.vn
+- hoangpp@nttco.vn
+- thinhdp@nttco.vn
 - nguyentthai96@gmail.com
-- trungvt3@vnpay.vn
-- lapnv@vnpay.vn
+- trungvt3@nttco.vn
+- lapnv@nttco.vn
 
 ## 3. Switch to an Account
 
@@ -47,7 +47,7 @@ Current accounts in your file:
 ## 4. With Enterprise Project ID (if needed)
 
 ```bash
-./switch-account.sh hoangpp@vnpay.vn your-project-id
+./switch-account.sh hoangpp@nttco.vn your-project-id
 ```
 
 ## What Happens During Switch

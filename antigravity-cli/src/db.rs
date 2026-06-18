@@ -2,22 +2,42 @@ use crate::protobuf;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-pub fn get_db_path() -> Result<PathBuf, String> {
+/// Resolve folder name based on target variant
+fn get_folder_name(target: &str) -> &str {
+    if target == "ide" {
+        "Antigravity IDE"
+    } else {
+        "Antigravity"
+    }
+}
+
+pub fn get_db_path(target: &str) -> Result<PathBuf, String> {
+    let folder_name = get_folder_name(target);
+
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().ok_or("Failed to get home directory")?;
-        Ok(home.join("Library/Application Support/Antigravity/User/globalStorage/state.vscdb"))
+        Ok(home.join(format!(
+            "Library/Application Support/{}/User/globalStorage/state.vscdb",
+            folder_name
+        )))
     }
     #[cfg(target_os = "windows")]
     {
         let appdata =
             std::env::var("APPDATA").map_err(|_| "Failed to get APPDATA environment variable".to_string())?;
-        Ok(PathBuf::from(appdata).join("Antigravity\\User\\globalStorage\\state.vscdb"))
+        Ok(PathBuf::from(appdata).join(format!(
+            "{}\\User\\globalStorage\\state.vscdb",
+            folder_name
+        )))
     }
     #[cfg(target_os = "linux")]
     {
         let home = dirs::home_dir().ok_or("Failed to get home directory")?;
-        Ok(home.join(".config/Antigravity/User/globalStorage/state.vscdb"))
+        Ok(home.join(format!(
+            ".config/{}/User/globalStorage/state.vscdb",
+            folder_name
+        )))
     }
 }
 

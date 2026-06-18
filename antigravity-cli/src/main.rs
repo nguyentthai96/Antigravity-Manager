@@ -22,11 +22,29 @@ struct Args {
     /// Optional GCP project ID to inject
     #[arg(short, long)]
     project_id: Option<String>,
+
+    /// Target Antigravity variant: "ide" for Antigravity IDE, "classic" for Antigravity (Classic)
+    #[arg(short, long, default_value = "ide")]
+    target: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let args = Args::parse();
+
+    // Normalize target value
+    let target = match args.target.to_lowercase().as_str() {
+        "ide" => "ide",
+        "classic" | "old" | "legacy" => "classic",
+        other => {
+            return Err(format!(
+                "Unknown target '{}'. Use 'ide' for Antigravity IDE or 'classic' for Antigravity (Classic).",
+                other
+            ));
+        }
+    };
+
+    println!("Target: Antigravity {}", if target == "ide" { "IDE" } else { "(Classic)" });
 
     // 1. Read the accounts JSON file
     let accounts_json = fs::read_to_string(&args.accounts_file)
@@ -50,17 +68,17 @@ async fn main() -> Result<(), String> {
     let expiry = chrono::Local::now().timestamp() + token_res.expires_in;
 
     // 4. Close Antigravity if running
-    if process::is_antigravity_running() {
-        process::close_antigravity(10)?;
+    if process::is_antigravity_running(target) {
+        process::close_antigravity(20, target)?;
     }
 
     // 5. Generate and inject new device profile
-    let storage_path = device::get_storage_path()?;
+    let storage_path = device::get_storage_path(target)?;
     let new_profile = device::generate_profile();
     device::write_profile(&storage_path, &new_profile)?;
 
     // 6. Inject Token into State DB
-    let db_path = db::get_db_path()?;
+    let db_path = db::get_db_path(target)?;
     let is_gcp_tos = true; // Hardcoded true or pass via argument if needed
     
     db::inject_token(
@@ -74,9 +92,9 @@ async fn main() -> Result<(), String> {
     )?;
 
     // 7. Restart Antigravity
-    process::start_antigravity()?;
+    process::start_antigravity(target)?;
 
-    println!("Account switch to {} completed successfully!", args.email);
+    println!("Account switch to {} completed successfully! (target: {})", args.email, target);
 
     Ok(())
 }

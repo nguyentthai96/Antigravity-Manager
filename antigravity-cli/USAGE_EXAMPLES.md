@@ -29,14 +29,14 @@ This will show you a numbered menu:
 
 Available Accounts:
 
-   1. thaint1@vnpay.vn
+   1. thaint1@nttco.vn
    2. pphstory@gmail.com
    3. phamhoang20092000@gmail.com
-   4. hoangpp@vnpay.vn
-   5. thinhdp@vnpay.vn
+   4. hoangpp@nttco.vn
+   5. thinhdp@nttco.vn
    6. nguyentthai96@gmail.com
-   7. trungvt3@vnpay.vn
-   8. lapnv@vnpay.vn
+   7. trungvt3@nttco.vn
+   8. lapnv@nttco.vn
 
 Enter account number (or 'q' to quit):
 ```
@@ -56,7 +56,7 @@ Just type the number and press Enter!
 
 ```bash
 # For enterprise accounts that need a project ID
-./switch-account.sh hoangpp@vnpay.vn my-gcp-project-123
+./switch-account.sh hoangpp@nttco.vn my-gcp-project-123
 ```
 
 ### List Accounts First
@@ -84,7 +84,7 @@ Just type the number and press Enter!
 ```bash
 ./target/release/antigravity-cli \
   --accounts-file ./antigravity_accounts.json \
-  --email hoangpp@vnpay.vn \
+  --email hoangpp@nttco.vn \
   --project-id my-gcp-project-123
 ```
 
@@ -106,7 +106,7 @@ Just type the number and press Enter!
 # Switch between multiple accounts in sequence
 ACCOUNTS=(
     "pphstory@gmail.com"
-    "hoangpp@vnpay.vn"
+    "hoangpp@nttco.vn"
     "nguyentthai96@gmail.com"
 )
 
@@ -150,7 +150,7 @@ done
 .\switch-account.ps1 -Email "pphstory@gmail.com"
 
 # With project ID
-.\switch-account.ps1 -Email "hoangpp@vnpay.vn" -ProjectId "my-project-123"
+.\switch-account.ps1 -Email "hoangpp@nttco.vn" -ProjectId "my-project-123"
 ```
 
 ### Command Prompt

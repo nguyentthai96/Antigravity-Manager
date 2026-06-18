@@ -7,28 +7,52 @@ use uuid::Uuid;
 use rusqlite::Connection;
 use crate::db::get_db_path;
 
-pub fn get_storage_path() -> Result<PathBuf, String> {
+/// Resolve folder name based on target variant
+fn get_folder_name(target: &str) -> &str {
+    if target == "ide" {
+        "Antigravity IDE"
+    } else {
+        "Antigravity"
+    }
+}
+
+pub fn get_storage_path(target: &str) -> Result<PathBuf, String> {
+    let folder_name = get_folder_name(target);
+
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
-        Ok(home.join("Library/Application Support/Antigravity/User/globalStorage/storage.json"))
+        Ok(home.join(format!(
+            "Library/Application Support/{}/User/globalStorage/storage.json",
+            folder_name
+        )))
     }
     #[cfg(target_os = "windows")]
     {
         let appdata =
             std::env::var("APPDATA").map_err(|_| "failed_to_get_appdata_env".to_string())?;
-        Ok(PathBuf::from(appdata).join("Antigravity\\User\\globalStorage\\storage.json"))
+        Ok(PathBuf::from(appdata).join(format!(
+            "{}\\User\\globalStorage\\storage.json",
+            folder_name
+        )))
     }
     #[cfg(target_os = "linux")]
     {
         let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
-        Ok(home.join(".config/Antigravity/User/globalStorage/storage.json"))
+        Ok(home.join(format!(
+            ".config/{}/User/globalStorage/storage.json",
+            folder_name
+        )))
     }
 }
 
 pub fn write_profile(storage_path: &Path, profile: &DeviceProfile) -> Result<(), String> {
     if !storage_path.exists() {
-        // If it doesn't exist, create an empty one with telemetry object
+        // If it doesn't exist, create parent dirs and an empty one with telemetry object
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed_to_create_storage_dir: {}", e))?;
+        }
         let initial_json = serde_json::json!({
             "telemetry": {}
         });
@@ -93,12 +117,19 @@ pub fn write_profile(storage_path: &Path, profile: &DeviceProfile) -> Result<(),
     fs::write(storage_path, updated).map_err(|e| format!("write_failed ({:?}): {}", storage_path, e))?;
     println!("Device profile written to {:?}", storage_path);
 
-    let _ = sync_state_service_machine_id_value(&profile.dev_device_id);
+    // Sync serviceMachineId to state.vscdb using the same target
+    // We derive target from the storage_path folder name
+    let target_from_path = if storage_path.to_string_lossy().contains("Antigravity IDE") {
+        "ide"
+    } else {
+        "classic"
+    };
+    let _ = sync_state_service_machine_id_value(&profile.dev_device_id, target_from_path);
     Ok(())
 }
 
-fn sync_state_service_machine_id_value(service_id: &str) -> Result<(), String> {
-    let db_path = get_db_path()?;
+fn sync_state_service_machine_id_value(service_id: &str, target: &str) -> Result<(), String> {
+    let db_path = get_db_path(target)?;
     if !db_path.exists() {
         return Ok(());
     }

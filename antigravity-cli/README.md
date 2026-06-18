@@ -33,6 +33,11 @@ The compiled binary will be at `target/release/antigravity-cli`
 ./antigravity-cli \
   --accounts-file ./antigravity_accounts.json \
   --email pphstory@gmail.com
+
+# Mặc định switch cho Antigravity IDE
+./antigravity-cli -a accounts.json -e user@gmail.com
+# Hoặc explicit cho Classic
+./antigravity-cli -a accounts.json -e user@gmail.com -t classic  
 ```
 
 ### With Enterprise Project ID
@@ -40,7 +45,7 @@ The compiled binary will be at `target/release/antigravity-cli`
 ```bash
 ./antigravity-cli \
   --accounts-file ./antigravity_accounts.json \
-  --email hoangpp@vnpay.vn \
+  --email hoangpp@nttco.vn \
   --project-id your-gcp-project-id
 ```
 
@@ -56,7 +61,7 @@ chmod +x switch-account.sh
 ./switch-account.sh pphstory@gmail.com
 
 # With project ID
-./switch-account.sh hoangpp@vnpay.vn your-gcp-project-id
+./switch-account.sh hoangpp@nttco.vn your-gcp-project-id
 ```
 
 ## Account File Format
@@ -67,7 +72,7 @@ The `antigravity_accounts.json` file should contain an array of accounts:
 [
   {
     "email": "user@example.com",
-    "refresh_token": "1//0g..."
+    "refresh_token": "..."
   }
 ]
 ```
