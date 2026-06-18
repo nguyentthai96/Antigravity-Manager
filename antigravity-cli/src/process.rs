@@ -7,28 +7,34 @@ use sysinfo::System;
 use std::os::windows::process::CommandExt;
 
 /// Check if a process is an Antigravity main process (not a thread/worker).
-///
-/// On Linux, Electron spawns many sub-processes that share the same exe path.
-/// We only want to match the "main" processes — those whose process name
-/// matches the binary name (e.g. "antigravity-ide"), NOT thread workers
-/// whose names are like "ThreadPoolForeg", "libuv-worker", "PerfettoTrace", etc.
+/// Cross-platform logic with special handling for macOS .app bundles.
 fn is_main_antigravity_process(name: &str, exe_path: &str, args_str: &str, target: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    let exe_path_lower = exe_path.to_lowercase();
+
     // Exclude extension/config directory processes
-    if exe_path.contains("/.antigravity-ide/") || exe_path.contains("/.antigravity/") {
+    if exe_path_lower.contains("/.antigravity-ide/") || exe_path_lower.contains("/.antigravity/") {
         return false;
     }
 
     // Exclude well-known non-Antigravity binaries
-    let binary_name = exe_path.rsplit('/').next().unwrap_or("");
-    if matches!(binary_name, "java" | "node" | "rust-analyzer" | "gopls" | "python" | "python3") {
+    let binary_name = exe_path.rsplit('/').next().unwrap_or("").to_lowercase();
+    if matches!(binary_name.as_str(), "java" | "node" | "rust-analyzer" | "gopls" | "python" | "python3" | "git") {
         return false;
     }
 
-    // Exclude helper sub-processes (crashpad, language_server, etc.)
-    if name.contains("crashpad")
-        || name.contains("language_server")
-        || exe_path.contains("crashpad")
-        || exe_path.contains("language_server")
+    // Exclude helper sub-processes (crashpad, language_server, renderer, gpu, plugin, etc.)
+    if name_lower.contains("crashpad")
+        || name_lower.contains("language_server")
+        || name_lower.contains("helper")
+        || name_lower.contains("plugin")
+        || name_lower.contains("renderer")
+        || name_lower.contains("gpu")
+        || name_lower.contains("utility")
+        || name_lower.contains("audio")
+        || name_lower.contains("sandbox")
+        || exe_path_lower.contains("crashpad")
+        || exe_path_lower.contains("language_server")
     {
         return false;
     }
@@ -38,16 +44,45 @@ fn is_main_antigravity_process(name: &str, exe_path: &str, args_str: &str, targe
         return false;
     }
 
+    // Platform-specific logic
     if target == "ide" {
-        // For IDE: the process name must be exactly "antigravity-ide"
-        // This excludes thread workers like "ThreadPoolForeg", "libuv-worker", etc.
-        name == "antigravity-ide"
-            && (exe_path.contains("/antigravity-ide/") || exe_path.ends_with("/antigravity-ide"))
+        // IDE target: Match "Antigravity IDE"
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS: Main process is often "Electron", check if inside Antigravity IDE.app bundle
+            if exe_path_lower.contains("antigravity ide.app") || exe_path_lower.contains("antigravity-ide.app") {
+                // Additional check: must not be a helper explicitly (already filtered above)
+                return !name_lower.contains("helper") && !name_lower.contains("gpu")
+                    && !name_lower.contains("renderer") && !name_lower.contains("plugin");
+            }
+            false
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // On Linux/Windows: Check process name and path
+            (name_lower.contains("antigravity-ide") || name_lower.contains("antigravity ide"))
+                && (exe_path_lower.contains("antigravity-ide") || exe_path_lower.contains("antigravity ide"))
+        }
     } else {
-        // For Classic: process name must be "antigravity" (exact)
-        // and NOT be the IDE variant
-        name == "antigravity"
-            && (exe_path.contains("/antigravity") && !exe_path.contains("antigravity-ide"))
+        // Classic/Client target: Match "Antigravity" but NOT "IDE"
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS: Check if inside Antigravity.app bundle (not IDE)
+            if exe_path_lower.contains("antigravity.app") && !exe_path_lower.contains("antigravity ide.app") && !exe_path_lower.contains("antigravity-ide.app") {
+                // Additional check: must not be a helper explicitly (already filtered above)
+                return !name_lower.contains("helper") && !name_lower.contains("gpu")
+                    && !name_lower.contains("renderer") && !name_lower.contains("plugin");
+            }
+            false
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // On Linux/Windows: Check process name and path
+            (name_lower.contains("antigravity") && !name_lower.contains("antigravity-ide") && !name_lower.contains("antigravity ide"))
+                && (exe_path_lower.contains("antigravity") && !exe_path_lower.contains("antigravity-ide") && !exe_path_lower.contains("antigravity ide"))
+        }
     }
 }
 
@@ -89,6 +124,9 @@ pub fn is_antigravity_running(target: &str) -> bool {
         }
 
         if is_main_antigravity_process(&name, &exe_path, &args_str, target) {
+            #[cfg(target_os = "macos")]
+            println!("[DEBUG] Found Antigravity ({}) process: PID={}, Name='{}', Exe='{}'",
+                     target, pid.as_u32(), name, exe_path);
             return true;
         }
     }
@@ -105,6 +143,9 @@ fn get_main_pids(target: &str) -> Vec<u32> {
 
     #[cfg(target_os = "linux")]
     let family_pids = get_self_family_pids(&system);
+
+    #[cfg(target_os = "macos")]
+    println!("[DEBUG] Scanning for '{}' processes on macOS...", target);
 
     for (pid, process) in system.processes() {
         let pid_u32 = pid.as_u32();
@@ -138,6 +179,11 @@ fn get_main_pids(target: &str) -> Vec<u32> {
         }
 
         if is_main_antigravity_process(&name, &exe_path, &args_str, target) {
+            #[cfg(target_os = "macos")]
+            {
+                println!("[DEBUG] ✓ Matched PID={}: name='{}', exe='{}'",
+                         pid_u32, name, exe_path);
+            }
             pids.push(pid_u32);
         }
     }
@@ -152,6 +198,9 @@ fn get_main_pids(target: &str) -> Vec<u32> {
                 println!("  PID={}, Name={}, Exe={}", pid_u32, name, exe);
             }
         }
+    } else {
+        #[cfg(target_os = "macos")]
+        println!("[DEBUG] No matching processes found for target '{}'", target);
     }
 
     pids
@@ -377,7 +426,23 @@ pub fn start_antigravity(target: &str) -> Result<(), String> {
         if !output.status.success() {
             return Err(format!("Startup failed: {}", String::from_utf8_lossy(&output.stderr)));
         }
-        println!("{} started successfully (macOS open).", label);
+
+        println!("Sent start command to {}. Waiting for app to launch...", label);
+
+        // Wait up to 8 seconds for the app process to appear
+        let mut attempts = 0;
+        let max_attempts = 40; // 40 * 200ms = 8 seconds
+
+        while attempts < max_attempts {
+            thread::sleep(Duration::from_millis(200));
+            if is_antigravity_running(target) {
+                println!("{} started successfully (verified running).", label);
+                return Ok(());
+            }
+            attempts += 1;
+        }
+
+        println!("{} launch command executed, but process detection timeout - app may still be starting.", label);
         return Ok(());
     }
 
