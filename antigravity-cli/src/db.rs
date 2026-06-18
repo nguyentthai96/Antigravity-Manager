@@ -49,6 +49,7 @@ pub fn inject_token(
     email: &str,
     is_gcp_tos: bool,
     project_id: Option<&str>,
+    id_token: Option<&str>,
 ) -> Result<String, String> {
     println!("Starting Token injection...");
     
@@ -61,6 +62,7 @@ pub fn inject_token(
         email,
         is_gcp_tos,
         project_id,
+        id_token,
     );
     
     if new_result.is_ok() {
@@ -89,10 +91,18 @@ fn inject_new_format(
     email: &str,
     is_gcp_tos: bool,
     project_id: Option<&str>,
+    id_token: Option<&str>,
 ) -> Result<String, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
     
-    let oauth_info = protobuf::create_oauth_info(access_token, refresh_token, expiry, is_gcp_tos);
+    let oauth_info = protobuf::create_oauth_info(
+        access_token,
+        refresh_token,
+        expiry,
+        is_gcp_tos,
+        id_token,
+        Some(email),
+    );
     let outer_b64 = protobuf::create_unified_state_entry("oauthTokenInfoSentinelKey", &oauth_info);
     
     conn.execute(

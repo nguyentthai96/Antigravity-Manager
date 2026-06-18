@@ -208,36 +208,76 @@ pub fn encode_varint_field(field_num: u32, value: u64) -> Vec<u8> {
 }
 
 /// 创建 OAuthTokenInfo 消息（不包含 Field 6 包装，用于新格式）
+///
+/// Structure:
+/// message OAuthTokenInfo {
+///     string access_token = 1;
+///     string token_type = 2;
+///     string refresh_token = 3;
+///     Timestamp expiry = 4;
+///     string id_token = 5;  // Required for session persistence across reboot
+///     bool is_gcp_tos = 6;
+/// }
 pub fn create_oauth_info(
     access_token: &str,
     refresh_token: &str,
     expiry: i64,
-    is_gcp_tos: bool,
+    mut is_gcp_tos: bool,
+    id_token: Option<&str>,
+    email: Option<&str>,
 ) -> Vec<u8> {
+    // Auto-correct is_gcp_tos for personal accounts
+    // Personal accounts must use standard Client ID for token refresh
+    if let Some(email_str) = email {
+        let is_personal = email_str.to_lowercase().ends_with("@gmail.com")
+            || email_str.to_lowercase().ends_with("@outlook.com")
+            || email_str.to_lowercase().ends_with("@hotmail.com")
+            || email_str.to_lowercase().ends_with("@qq.com")
+            || email_str.to_lowercase().ends_with("@163.com");
+
+        if is_personal && is_gcp_tos {
+            println!("[Protobuf] Auto-correcting GCP flag for personal account ({})", email_str);
+            is_gcp_tos = false;
+        }
+    }
+
     // Field 1: access_token
     let field1 = encode_string_field(1, access_token);
-    
+
     // Field 2: token_type = "Bearer"
     let field2 = encode_string_field(2, "Bearer");
-    
+
     // Field 3: refresh_token
     let field3 = encode_string_field(3, refresh_token);
-    
-    // Field 4: expiry (嵌套的 Timestamp 消息)
-    let timestamp_tag = (1 << 3) | 0;
-    let mut timestamp_msg = encode_varint(timestamp_tag);
+
+    // Field 4: expiry (Nested Timestamp message)
+    // message Timestamp { int64 seconds = 1; int32 nanos = 2; }
+    let seconds_tag = (1 << 3) | 0;
+    let mut timestamp_msg = encode_varint(seconds_tag);
     timestamp_msg.extend(encode_varint(expiry as u64));
+
+    // Field 2: nanos (0) — required for format compatibility
+    let nanos_tag = (2 << 3) | 0;
+    timestamp_msg.extend(encode_varint(nanos_tag));
+    timestamp_msg.extend(encode_varint(0));
+
     let field4 = encode_len_delim_field(4, &timestamp_msg);
-    
-    // Field 6: is_gcp_tos = true
+
+    // Field 5: id_token (required for session persistence across reboot)
+    let field5 = id_token.map(|it| encode_string_field(5, it));
+
+    // Field 6: is_gcp_tos
     let field6 = is_gcp_tos.then(|| encode_varint_field(6, 1));
 
-    // 合并所有字段为 OAuthTokenInfo 消息
+    // Merge all fields into OAuthTokenInfo message
     let mut oauth_info = Vec::new();
     oauth_info.extend(field1);
     oauth_info.extend(field2);
     oauth_info.extend(field3);
     oauth_info.extend(field4);
+    if let Some(field5) = field5 {
+        oauth_info.extend(field5);
+    }
     if let Some(field6) = field6 {
         oauth_info.extend(field6);
     }

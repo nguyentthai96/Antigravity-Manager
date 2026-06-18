@@ -13,6 +13,8 @@ pub struct TokenResponse {
     pub token_type: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub id_token: Option<String>,
 }
 
 pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenResponse, String> {

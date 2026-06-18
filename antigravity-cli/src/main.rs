@@ -79,7 +79,7 @@ async fn main() -> Result<(), String> {
 
     // 6. Inject Token into State DB
     let db_path = db::get_db_path(target)?;
-    let is_gcp_tos = true; // Hardcoded true or pass via argument if needed
+    let is_gcp_tos = true; // Will be auto-corrected for personal accounts in protobuf
     
     db::inject_token(
         &db_path,
@@ -89,6 +89,7 @@ async fn main() -> Result<(), String> {
         &target_account.email,
         is_gcp_tos,
         args.project_id.as_deref(),
+        token_res.id_token.as_deref(),
     )?;
 
     // 7. Restart Antigravity
