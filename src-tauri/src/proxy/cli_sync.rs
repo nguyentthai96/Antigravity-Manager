@@ -564,13 +564,28 @@ pub fn sync_config(
                             Value::String(proxy_url.to_string()),
                         );
                         if !api_key.is_empty() {
-                            env_obj.insert(
-                                "ANTHROPIC_API_KEY".to_string(),
-                                Value::String(api_key.to_string()),
-                            );
-
-                            // [FIX] 避免冲突：如果存在则移除 ANTHROPIC_AUTH_TOKEN
-                            env_obj.remove("ANTHROPIC_AUTH_TOKEN");
+                            if proxy_url.contains("apikey.fun") {
+                                env_obj.insert(
+                                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                                    Value::String(api_key.to_string()),
+                                );
+                                env_obj.insert(
+                                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                                    Value::String("1".to_string()),
+                                );
+                                env_obj.insert(
+                                    "CLAUDE_CODE_ATTRIBUTION_HEADER".to_string(),
+                                    Value::String("0".to_string()),
+                                );
+                                env_obj.remove("ANTHROPIC_API_KEY");
+                            } else {
+                                env_obj.insert(
+                                    "ANTHROPIC_API_KEY".to_string(),
+                                    Value::String(api_key.to_string()),
+                                );
+                                // [FIX] 避免冲突：如果存在则移除 ANTHROPIC_AUTH_TOKEN
+                                env_obj.remove("ANTHROPIC_AUTH_TOKEN");
+                            }
 
                             // [FIX] 清理可能来自其他 Provider 的模型覆盖设置
                             env_obj.remove("ANTHROPIC_MODEL");
@@ -580,6 +595,7 @@ pub fn sync_config(
                         } else {
                             // 如果 API Key 为空，则移除该键，避免设置为空字符串
                             env_obj.remove("ANTHROPIC_API_KEY");
+                            env_obj.remove("ANTHROPIC_AUTH_TOKEN");
                         }
                     }
 
@@ -601,11 +617,15 @@ pub fn sync_config(
                             "OPENAI_API_KEY".to_string(),
                             Value::String(api_key.to_string()),
                         );
-                        // Codex 的 auth.json 似乎也支持 OPENAI_BASE_URL，但 ccs 没写，我们也同步写一下
-                        obj.insert(
-                            "OPENAI_BASE_URL".to_string(),
-                            Value::String(proxy_url.to_string()),
-                        );
+                        if proxy_url.contains("apikey.fun") {
+                            obj.remove("OPENAI_BASE_URL");
+                        } else {
+                            // Codex 的 auth.json 似乎也支持 OPENAI_BASE_URL，但 ccs 没写，我们也同步写一下
+                            obj.insert(
+                                "OPENAI_BASE_URL".to_string(),
+                                Value::String(proxy_url.to_string()),
+                            );
+                        }
                     }
                     content = serde_json::to_string_pretty(&json).unwrap();
                 } else if file.name == "config.toml" {
@@ -614,31 +634,64 @@ pub fn sync_config(
                         .parse::<DocumentMut>()
                         .unwrap_or_else(|_| DocumentMut::new());
 
+                    // 必须使用 custom 提供商，Codex 不支持原生的 codex provider
+                    let provider_key = "custom";
+                    let display_name = if proxy_url.contains("apikey.fun") {
+                        "APIKEY.FUN"
+                    } else {
+                        "Custom Node"
+                    };
+
+                    // 优先设置 Root Keys 确保位于顶部
+                    doc.insert("model_provider", value(provider_key));
+
+                    if proxy_url.contains("apikey.fun") {
+                        doc.insert("model", value("gpt-5.5"));
+                        doc.insert("review_model", value("gpt-5.5"));
+                        doc.insert("model_reasoning_effort", value("high"));
+                        doc.insert("disable_response_storage", value(true));
+                        doc.insert("network_access", value("enabled"));
+                        doc.insert("windows_wsl_setup_acknowledged", value(true));
+                        doc.insert("model_context_window", value(270000));
+                        doc.insert("model_auto_compact_token_limit", value(270000));
+                        doc.insert("effective_context_window_percent", value(95));
+                    } else {
+                        if let Some(m) = model {
+                            doc.insert("model", value(m));
+                        }
+                    }
+
+                    // 移除可能的根级别旧配置
+                    doc.remove("openai_api_key");
+                    doc.remove("openai_base_url");
+
                     // 设置层级 [model_providers.custom]
                     let providers = doc
                         .entry("model_providers")
                         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
                     if let Some(p_table) = providers.as_table_mut() {
                         let custom = p_table
-                            .entry("custom")
+                            .entry(provider_key)
                             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
                         if let Some(c_table) = custom.as_table_mut() {
-                            c_table.insert("name", value("custom"));
+                            c_table.insert("name", value(display_name));
                             c_table.insert("wire_api", value("responses"));
                             c_table.insert("requires_openai_auth", value(true));
-                            c_table.insert("base_url", value(proxy_url));
+                            c_table.insert("base_url", value(proxy_url.to_string()));
                             if let Some(m) = model {
                                 c_table.insert("model", value(m));
                             }
                         }
                     }
-                    doc.insert("model_provider", value("custom"));
-                    if let Some(m) = model {
-                        doc.insert("model", value(m));
+
+                    if proxy_url.contains("apikey.fun") {
+                        let features = doc
+                            .entry("features")
+                            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+                        if let Some(f_table) = features.as_table_mut() {
+                            f_table.insert("goals", value(true));
+                        }
                     }
-                    // Codex 还需要清理可能存在的旧配置项
-                    doc.remove("openai_api_key");
-                    doc.remove("openai_base_url");
                     content = doc.to_string();
                 }
             }
@@ -743,25 +796,29 @@ pub fn sync_config(
 
 #[tauri::command]
 pub async fn get_cli_sync_status(app_type: CliApp, proxy_url: String) -> Result<CliStatus, String> {
-    let (installed, version) = check_cli_installed(&app_type);
-    let (is_synced, has_backup, current_base_url) = if installed {
-        get_sync_status(&app_type, &proxy_url)
-    } else {
-        (false, false, None)
-    };
+    tokio::task::spawn_blocking(move || {
+        let (installed, version) = check_cli_installed(&app_type);
+        let (is_synced, has_backup, current_base_url) = if installed {
+            get_sync_status(&app_type, &proxy_url)
+        } else {
+            (false, false, None)
+        };
 
-    Ok(CliStatus {
-        installed,
-        version,
-        is_synced,
-        has_backup,
-        current_base_url,
-        files: app_type
-            .config_files()
-            .into_iter()
-            .map(|f| f.name)
-            .collect(),
+        Ok(CliStatus {
+            installed,
+            version,
+            is_synced,
+            has_backup,
+            current_base_url,
+            files: app_type
+                .config_files()
+                .into_iter()
+                .map(|f| f.name)
+                .collect(),
+        })
     })
+    .await
+    .unwrap_or_else(|_| Err("Task panicked".to_string()))
 }
 
 #[tauri::command]
@@ -771,37 +828,45 @@ pub async fn execute_cli_sync(
     api_key: String,
     model: Option<String>,
 ) -> Result<(), String> {
-    sync_config(&app_type, &proxy_url, &api_key, model.as_deref())
+    tokio::task::spawn_blocking(move || {
+        sync_config(&app_type, &proxy_url, &api_key, model.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| Err("Task panicked".to_string()))
 }
 
 #[tauri::command]
 pub async fn execute_cli_restore(app_type: CliApp) -> Result<(), String> {
-    let files = app_type.config_files();
-    let mut restored_count = 0;
+    tokio::task::spawn_blocking(move || {
+        let files = app_type.config_files();
+        let mut restored_count = 0;
 
-    // 尝试从备份恢复
-    for file in &files {
-        let backup_path = file
-            .path
-            .with_file_name(format!("{}.antigravity.bak", file.name));
-        if backup_path.exists() {
-            // 还原：覆盖原文件
-            if let Err(e) = fs::rename(&backup_path, &file.path) {
-                return Err(format!("恢复备份失败 {}: {}", file.name, e));
+        // 尝试从备份恢复
+        for file in &files {
+            let backup_path = file
+                .path
+                .with_file_name(format!("{}.antigravity.bak", file.name));
+            if backup_path.exists() {
+                // 还原：覆盖原文件
+                if let Err(e) = fs::rename(&backup_path, &file.path) {
+                    return Err(format!("恢复备份失败 {}: {}", file.name, e));
+                }
+                restored_count += 1;
             }
-            restored_count += 1;
         }
-    }
 
-    if restored_count > 0 {
-        // 如果成功恢复了至少一个备份，就认为是恢复成功
-        return Ok(());
-    }
+        if restored_count > 0 {
+            // 如果成功恢复了至少一个备份，就认为是恢复成功
+            return Ok(());
+        }
 
-    // 如果没有备份，则执行原来的逻辑：恢复为默认配置
-    let default_url = app_type.default_url();
-    // 恢复默认时清空 API Key，让用户重新授权或使用官方 Key
-    sync_config(&app_type, default_url, "", None)
+        // 如果没有备份，则执行原来的逻辑：恢复为默认配置
+        let default_url = app_type.default_url();
+        // 恢复默认时清空 API Key，让用户重新授权或使用官方 Key
+        sync_config(&app_type, default_url, "", None)
+    })
+    .await
+    .unwrap_or_else(|_| Err("Task panicked".to_string()))
 }
 
 #[tauri::command]
@@ -809,21 +874,25 @@ pub async fn get_cli_config_content(
     app_type: CliApp,
     file_name: Option<String>,
 ) -> Result<String, String> {
-    let files = app_type.config_files();
-    let file = if let Some(name) = file_name {
-        files
-            .into_iter()
-            .find(|f| f.name == name)
-            .ok_or("找不到指定的文件".to_string())?
-    } else {
-        files
-            .into_iter()
-            .next()
-            .ok_or("找不到配置文件".to_string())?
-    };
+    tokio::task::spawn_blocking(move || {
+        let files = app_type.config_files();
+        let file = if let Some(name) = file_name {
+            files
+                .into_iter()
+                .find(|f| f.name == name)
+                .ok_or("找不到指定的文件".to_string())?
+        } else {
+            files
+                .into_iter()
+                .next()
+                .ok_or("找不到配置文件".to_string())?
+        };
 
-    if !file.path.exists() {
-        return Err("配置文件不存在".to_string());
-    }
-    fs::read_to_string(&file.path).map_err(|e| format!("读取配置文件失败: {}", e))
+        if !file.path.exists() {
+            return Err("配置文件不存在".to_string());
+        }
+        fs::read_to_string(&file.path).map_err(|e| format!("读取配置文件失败: {}", e))
+    })
+    .await
+    .unwrap_or_else(|_| Err("Task panicked".to_string()))
 }

@@ -45,9 +45,15 @@ impl SystemIntegration for DesktopIntegration {
 
             let is_running = process::is_process_running_by_name("agy");
             let msg = if is_running {
-                format!("Account {} activated. Agy is running, token will be picked up automatically.", account.email)
+                format!(
+                    "Account {} activated. Agy is running, token will be picked up automatically.",
+                    account.email
+                )
             } else {
-                format!("Account {} activated. Token is ready for your next CLI command.", account.email)
+                format!(
+                    "Account {} activated. Token is ready for your next CLI command.",
+                    account.email
+                )
             };
             self.show_notification("Antigravity CLI", &msg);
             self.update_tray();
@@ -61,7 +67,22 @@ impl SystemIntegration for DesktopIntegration {
         }
 
         // 2. 智能决策：是否使用最新的系统 Keychain 凭据管理器方式存储 Token
-        let is_ide = target_ide == Some("ide");
+        let mut is_ide = target_ide == Some("ide");
+
+        // Auto-detect IDE: if the located executable is the IDE, treat as IDE mode
+        if !is_ide {
+            if let Some(exe_path) = process::get_antigravity_executable_path(target_ide) {
+                let path_lower = exe_path.to_string_lossy().to_lowercase();
+                if path_lower.contains("antigravity ide") || path_lower.contains("antigravity-ide")
+                {
+                    is_ide = true;
+                    crate::modules::logger::log_info(
+                        "[Desktop] Auto-detected Antigravity IDE executable, using IDE account switch logic.",
+                    );
+                }
+            }
+        }
+
         let mut use_keyring = false;
 
         if !is_ide {
@@ -320,6 +341,8 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
     {
         // 2.3 Linux Secret Service API
         use std::io::Write;
+        use std::sync::mpsc;
+
         let mut child = Command::new("secret-tool")
             .args([
                 "store",
@@ -339,11 +362,39 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
             stdin
                 .write_all(payload_json.as_bytes())
                 .map_err(|e| format!("Failed to write to secret-tool stdin: {}", e))?;
+            // stdin is dropped here, closing the pipe and signalling EOF to secret-tool
         }
 
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("Failed to wait for secret-tool: {}", e))?;
+        // Protect against indefinite blocking when D-Bus is unavailable (common on Wayland
+        // sessions where DBUS_SESSION_BUS_ADDRESS is not inherited by the Tauri process).
+        let child_pid = child.id();
+        let (tx, rx) = mpsc::channel::<Result<std::process::Output, std::io::Error>>();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+
+        let output = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result.map_err(|e| format!("Failed to wait for secret-tool: {}", e))?,
+            Err(_) => {
+                // secret-tool has been blocked for more than 10 seconds.
+                // Most likely cause: D-Bus session bus is not reachable from the Tauri process
+                // (typical on Wayland without proper DBUS_SESSION_BUS_ADDRESS propagation).
+                // Kill the hung subprocess before returning the error.
+                let _ = Command::new("kill")
+                    .args(["-9", &child_pid.to_string()])
+                    .output();
+                crate::modules::logger::log_error(
+                    "[Desktop] secret-tool store blocked for >10s — D-Bus session bus unreachable. \
+                     Ensure gnome-keyring/kwallet is running and DBUS_SESSION_BUS_ADDRESS is exported.",
+                );
+                return Err(
+                    "Keyring write timed out (10s). The D-Bus session bus is not reachable from this process, \
+                     which is common on Wayland without proper session setup. \
+                     Please ensure gnome-keyring or kwallet is running."
+                        .to_string(),
+                );
+            }
+        };
 
         if !output.status.success() {
             let err_msg = String::from_utf8_lossy(&output.stderr);
@@ -355,6 +406,148 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
         "[Desktop] Successfully wrote token to system credential store.",
     );
     Ok(())
+}
+
+/// 辅助方法：从宿主操作系统的 Keychain/Credentials Manager 读取 Token
+pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedOAuthState, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let output = Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "gemini",
+                "-a",
+                "antigravity",
+                "-w",
+            ])
+            .output()
+            .map_err(|e| format!("Failed to execute security command: {}", e))?;
+
+        if !output.status.success() {
+            return Err("No credential found in macOS Keychain".to_string());
+        }
+
+        let secret_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let payload_str = if secret_str.starts_with("go-keyring-base64:") {
+            let b64_part = &secret_str["go-keyring-base64:".len()..];
+            let decoded = STANDARD.decode(b64_part).map_err(|e| format!("Base64 decode failed: {}", e))?;
+            String::from_utf8(decoded).map_err(|e| format!("UTF-8 decode failed: {}", e))?
+        } else {
+            secret_str
+        };
+
+        return parse_keyring_payload(&payload_str);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+
+        #[repr(C)]
+        struct FILETIME {
+            dw_low_date_time: u32,
+            dw_high_date_time: u32,
+        }
+
+        #[repr(C)]
+        struct CREDENTIALW {
+            flags: u32,
+            cred_type: u32,
+            target_name: *const u16,
+            comment: *const u16,
+            last_written: FILETIME,
+            credential_blob_size: u32,
+            credential_blob: *mut u8,
+            persist: u32,
+            attribute_count: u32,
+            attributes: *const std::ffi::c_void,
+            target_alias: *const u16,
+            user_name: *const u16,
+        }
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn CredReadW(
+                target_name: *const u16,
+                type_: u32,
+                flags: u32,
+                credential: *mut *mut CREDENTIALW,
+            ) -> i32;
+            fn CredFree(buffer: *mut std::ffi::c_void);
+        }
+
+        let target = "gemini:antigravity";
+        let target_wide: Vec<u16> = std::ffi::OsStr::new(target)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut cred_ptr: *mut CREDENTIALW = ptr::null_mut();
+        unsafe {
+            let res = CredReadW(target_wide.as_ptr(), 1, 0, &mut cred_ptr);
+            if res == 0 || cred_ptr.is_null() {
+                return Err("No credential found in Windows Credential Manager".to_string());
+            }
+
+            let cred = &*cred_ptr;
+            let blob = std::slice::from_raw_parts(
+                cred.credential_blob,
+                cred.credential_blob_size as usize,
+            );
+            let payload_str = String::from_utf8_lossy(blob).to_string();
+            CredFree(cred_ptr as *mut std::ffi::c_void);
+
+            return parse_keyring_payload(&payload_str);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("secret-tool")
+            .args([
+                "lookup",
+                "service",
+                "gemini",
+                "username",
+                "antigravity",
+            ])
+            .output()
+            .map_err(|e| format!("Failed to execute secret-tool: {}", e))?;
+
+        if !output.status.success() {
+            return Err("No credential found in Linux secret-tool".to_string());
+        }
+
+        let payload_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return parse_keyring_payload(&payload_str);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Err("Keyring not supported on this operating system".to_string())
+    }
+}
+
+fn parse_keyring_payload(payload_str: &str) -> Result<crate::modules::migration::ImportedOAuthState, String> {
+    let json: serde_json::Value = serde_json::from_str(payload_str)
+        .map_err(|e| format!("Failed to parse keyring payload JSON: {}", e))?;
+
+    let refresh_token = json
+        .get("token")
+        .and_then(|t| t.get("refresh_token"))
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("refresh_token").and_then(|v| v.as_str()))
+        .ok_or_else(|| "Refresh Token not found in keyring payload".to_string())?
+        .to_string();
+
+    Ok(crate::modules::migration::ImportedOAuthState {
+        refresh_token,
+        is_gcp_tos: true,
+        project_id: None,
+    })
 }
 
 /// Headless/Docker 实现：仅执行数据层操作，忽略 UI 和进程控制

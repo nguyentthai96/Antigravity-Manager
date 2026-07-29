@@ -243,6 +243,145 @@ use super::common::{
 
 // ===== 退避策略模块结束 =====
 
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    fn request_with_effort(model: &str, effort: &str, budget_tokens: u32) -> ClaudeRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "test"}],
+            "thinking": {"type": "enabled", "budget_tokens": budget_tokens},
+            "output_config": {"effort": effort}
+        }))
+        .expect("test request must deserialize")
+    }
+
+    #[test]
+    fn applies_flash_low_effort_and_removes_output_config_before_serialization() {
+        let mut request = request_with_effort("gemini-3.5-flash", "low", 10_000);
+        let effort = crate::proxy::common::variant_mapping::tier_from_effort(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.effort.as_deref()),
+        );
+
+        apply_variant(&mut request, effort, Some(10_000)).expect("Gemini 3.5 Flash must resolve");
+
+        assert_eq!(request.model, "gemini-3.5-flash-extra-low");
+        assert!(request.output_config.is_none());
+        assert!(serde_json::to_value(request)
+            .expect("resolved request must serialize")
+            .get("output_config")
+            .is_none());
+    }
+
+    #[test]
+    fn applies_pro_high_effort_over_low_budget() {
+        let mut request = request_with_effort("gemini-3.1-pro", "high", 1_000);
+        let effort = crate::proxy::common::variant_mapping::tier_from_effort(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.effort.as_deref()),
+        );
+
+        apply_variant(&mut request, effort, Some(1_000)).expect("Gemini 3.1 Pro must resolve");
+
+        assert_eq!(request.model, "gemini-pro-agent");
+    }
+
+    #[test]
+    fn invalid_effort_falls_back_to_budget_tokens_for_gemini_3_model() {
+        // Given a Gemini 3 model ("gemini-3-flash") with an unrecognized
+        // effort value ("max"), tier_from_effort returns None, so
+        // apply_variant falls back to budget-based tier inference.
+        let mut request = request_with_effort("gemini-3-flash", "max", 4_000);
+        let effort = crate::proxy::common::variant_mapping::tier_from_effort(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.effort.as_deref()),
+        );
+
+        // tier_from_effort(Some("max")) → None (invalid value)
+        assert_eq!(effort, None);
+
+        // With effort=None and budget=4_000, infer_tier → Medium →
+        // resolve_with_tier("gemini-3-flash", None, Some(4_000)) →
+        // SPEC_35_FLASH_LOW → physical id "gemini-3.5-flash-low"
+        apply_variant(&mut request, effort, Some(4_000))
+            .expect("gemini-3-flash must resolve even without valid effort");
+
+        assert_eq!(request.model, "gemini-3.5-flash-low");
+        assert!(request.output_config.is_none());
+        // SPEC_35_FLASH_LOW has thinking_budget=4_000, preserve_client_budget=false
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(4_000)
+        );
+    }
+
+    #[test]
+    fn claude_model_without_variant_mapping_preserves_output_config_on_none() {
+        // claude-sonnet-4-5 is NOT in GEMINI_FAMILIES and NOT in
+        // resolve_non_variant_model, so resolve_with_tier returns None,
+        // and apply_variant returns None without mutating the request.
+        let mut request = request_with_effort("claude-sonnet-4-5", "high", 10_000);
+        let effort = crate::proxy::common::variant_mapping::tier_from_effort(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.effort.as_deref()),
+        );
+
+        let result = apply_variant(&mut request, effort, Some(10_000));
+        assert!(
+            result.is_none(),
+            "unregistered Claude model must return None"
+        );
+
+        // Model and output_config must remain untouched.
+        assert_eq!(request.model, "claude-sonnet-4-5");
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|c| c.effort.as_deref()),
+            Some("high")
+        );
+    }
+}
+
+fn apply_variant(
+    request: &mut ClaudeRequest,
+    effort_tier: Option<crate::proxy::common::variant_mapping::VariantTier>,
+    client_budget: Option<u32>,
+) -> Option<crate::proxy::common::variant_mapping::RealModelSpec> {
+    let spec = crate::proxy::common::variant_mapping::resolve_with_tier(
+        &request.model,
+        effort_tier,
+        client_budget,
+    )?;
+
+    request.model = spec.id.to_string();
+    if spec.thinking_budget == 0 {
+        request.thinking = None;
+        request.tools = None;
+    } else {
+        request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+            effort: None,
+        });
+    }
+    request.output_config = None;
+    request.max_tokens = Some(spec.max_output_tokens);
+
+    Some(spec)
+}
+
 /// 处理 Claude messages 请求
 ///
 /// 处理 Chat 消息请求流程
@@ -312,6 +451,26 @@ pub async fn handle_messages(
     let temp_cap = model_specs::get_thinking_budget(&request.model, None);
     let thinking_hint = extract_thinking_hint(&original_body);
     apply_thinking_hints(&mut request, &thinking_hint, &trace_id, temp_cap);
+
+    // [Variant] Resolve canonical model + variant → real model + real params.
+    let client_budget = original_body
+        .get("thinking")
+        .and_then(|t| t.get("budget_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let effort_hint = request
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.clone());
+    let effort_tier =
+        crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
+    let canonical_model = request.model.clone();
+    if let Some(spec) = apply_variant(&mut request, effort_tier, client_budget) {
+        tracing::info!(
+            "[{}] [Variant] canonical='{}' effort_hint={:?} budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
+            trace_id, canonical_model, effort_hint, client_budget, spec.id, spec.thinking_budget, spec.max_output_tokens
+        );
+    }
 
     if debug_logger::is_enabled(&debug_cfg) {
         // [FIX] 使用原始 body 副本记录日志，确保不丢失任何字段
@@ -406,6 +565,59 @@ pub async fn handle_messages(
         close_tool_loop_for_thinking(&mut request.messages);
     }
 
+    let experimental_cfg = state.experimental.read().await;
+    let compression_level = if experimental_cfg.compression_level == "disabled" {
+        if experimental_cfg.enable_usage_scaling {
+            "high".to_string()
+        } else {
+            "disabled".to_string()
+        }
+    } else {
+        experimental_cfg.compression_level.clone()
+    };
+
+    if compression_level != "disabled" {
+        // [ACC-P RTK] Low, Medium, High 等级均对传入的工具返回日志执行静态 RTK 去噪折叠
+        for msg in &mut request.messages {
+            crate::proxy::mappers::context_manager::ContextManager::clean_tool_message(msg);
+        }
+
+        // [ACC-P Caveman] Medium, High 等级对除最近 4 条（~2轮）以外的旧对话常驻执行 Caveman 提纯
+        if compression_level == "medium" || compression_level == "high" {
+            let total_msgs = request.messages.len();
+            let start_protection_idx = total_msgs.saturating_sub(4);
+            for (i, msg) in request.messages.iter_mut().enumerate() {
+                if i >= start_protection_idx {
+                    continue;
+                }
+                if msg.role == "user" || msg.role == "assistant" {
+                    match &mut msg.content {
+                        crate::proxy::mappers::claude::models::MessageContent::String(s) => {
+                            let cleaned =
+                                crate::proxy::mappers::caveman_cleaner::CavemanCleaner::clean(s);
+                            if cleaned != *s {
+                                *s = cleaned;
+                            }
+                        }
+                        crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => {
+                            for block in blocks {
+                                if let crate::proxy::mappers::claude::models::ContentBlock::Text {
+                                    text,
+                                } = block
+                                {
+                                    let cleaned = crate::proxy::mappers::caveman_cleaner::CavemanCleaner::clean(text);
+                                    if cleaned != *text {
+                                        *text = cleaned;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ===== [Issue #467 Fix] 拦截 Claude Code Warmup 请求 =====
     // Claude Code 会每 10 秒发送一次 warmup 请求来保持连接热身，
     // 这些请求会消耗大量配额。检测到 warmup 请求后直接返回模拟响应。
@@ -419,13 +631,16 @@ pub async fn handle_messages(
 
     if use_zai {
         // 重新序列化修复后的请求体
-        let new_body = match serde_json::to_value(&request) {
+        let mut new_body = match serde_json::to_value(&request) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("Failed to serialize fixed request for z.ai: {}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
+
+        // Inject cache_control into the XML summary message if it is a Forked session
+        inject_cache_control_to_forked_summary(&mut new_body);
 
         return crate::proxy::providers::zai_anthropic::forward_anthropic_json(
             &state,
@@ -584,6 +799,7 @@ pub async fn handle_messages(
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
+    let mut force_rotate = false;
 
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
@@ -616,11 +832,10 @@ pub async fn handle_messages(
             crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body);
         let session_id = Some(session_id_str.as_str());
 
-        let force_rotate_token = attempt > 0;
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
             .get_token(
                 &config.request_type,
-                force_rotate_token,
+                force_rotate,
                 session_id,
                 &config.final_model,
             )
@@ -703,7 +918,7 @@ pub async fn handle_messages(
         let mut is_purified = false;
         let mut compression_applied = false;
 
-        if !retried_without_thinking && scaling_enabled {
+        if !retried_without_thinking && compression_level == "high" {
             // 新增 scaling_enabled 联动判断
             // 1. Determine context limit (Flash: ~1M, Pro: ~2M)
             let context_limit = if mapped_model.contains("flash") {
@@ -1562,7 +1777,6 @@ pub async fn handle_messages(
             determine_retry_strategy(status_code, &error_text, retried_without_thinking);
 
         // 执行退避
-        let mut force_rotate = false;
         if apply_retry_strategy(
             retry_strategy.clone(),
             attempt,
@@ -1746,6 +1960,40 @@ pub async fn handle_count_tokens(
         "output_tokens": 0
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod opus_variant_tests {
+    use crate::proxy::common::variant_mapping;
+    use crate::proxy::mappers::claude::models::ThinkingConfig;
+
+    #[test]
+    fn claude_opus_preserves_client_budget_when_present() {
+        let client_budget = Some(32_768);
+        let spec = variant_mapping::resolve("claude-opus-4-6-thinking", client_budget)
+            .expect("Claude Opus 4.6 thinking must resolve");
+        let request_thinking = ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+            effort: None,
+        };
+
+        assert_eq!(request_thinking.budget_tokens, client_budget);
+    }
+
+    #[test]
+    fn claude_opus_falls_back_to_spec_budget_when_client_budget_is_absent() {
+        let client_budget = None;
+        let spec = variant_mapping::resolve("claude-opus-4-6-thinking", client_budget)
+            .expect("Claude Opus 4.6 thinking must resolve");
+        let request_thinking = ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+            effort: None,
+        };
+
+        assert_eq!(request_thinking.budget_tokens, Some(1_024));
+    }
 }
 
 // 移除已失效的简单单元测试，后续将补全完整的集成测试
@@ -2203,13 +2451,18 @@ async fn try_compress_with_summary(
     );
 
     // 4. Create forked conversation with summary as prefix
+    // Wrap text inside a ContentBlock::Text and attach cache_control to freeze it in upstream's Prompt Cache
     let mut forked_messages = vec![
         Message {
             role: "user".to_string(),
-            content: MessageContent::String(format!(
-                "Context has been compressed. Here is the structured summary of our conversation history:\n\n{}",
-                xml_summary
-            )),
+            content: MessageContent::Array(vec![
+                crate::proxy::mappers::claude::models::ContentBlock::Text {
+                    text: format!(
+                        "Context has been compressed. Here is the structured summary of our conversation history:\n\n{}",
+                        xml_summary
+                    ),
+                }
+            ]),
         },
         Message {
             role: "assistant".to_string(),
@@ -2254,4 +2507,35 @@ async fn try_compress_with_summary(
         size: original_request.size.clone(),
         quality: original_request.quality.clone(),
     })
+}
+
+/// Injects cache_control ephemeral trigger to first message's content block if it's the XML summary
+fn inject_cache_control_to_forked_summary(body: &mut serde_json::Value) {
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        if !messages.is_empty() {
+            let first_msg = &mut messages[0];
+            if let Some(content) = first_msg.get_mut("content") {
+                if let Some(content_arr) = content.as_array_mut() {
+                    if !content_arr.is_empty() {
+                        let is_summary = content_arr[0]
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.contains("Context has been compressed"))
+                            .unwrap_or(false);
+
+                        if is_summary {
+                            if let Some(obj) = content_arr[0].as_object_mut() {
+                                obj.insert(
+                                    "cache_control".to_string(),
+                                    serde_json::json!({
+                                        "type": "ephemeral"
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

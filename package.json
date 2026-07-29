@@ -1,6 +1,7 @@
 {
-  "version": "4.2.3",
+  "version": "4.4.9",
   "name": "antigravity-tools",
+  "description": "Antigravity Tools",
   "type": "module",
   "private": true,
   "scripts": {

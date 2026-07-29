@@ -16,11 +16,44 @@ pub mod security;
 pub mod proxy_pool;
 // 导出 user_token 命令
 pub mod user_token;
+// 导出 patch 命令
+pub mod patch;
+pub use patch::*;
 
 /// 列出所有账号
 #[tauri::command]
-pub async fn list_accounts() -> Result<Vec<Account>, String> {
-    modules::list_accounts()
+pub async fn list_accounts(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<Vec<Account>, String> {
+    let mut accounts = tokio::task::spawn_blocking(move || modules::list_accounts())
+        .await
+        .unwrap_or_else(|_| Err("Task panicked".to_string()))?;
+
+    // [FIX] Blend in-memory TokenManager rate limit status into the UI quota display
+    let instance_lock = proxy_state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        for account in &mut accounts {
+            if let Some(reset_secs) = instance
+                .token_manager
+                .get_rate_limit_reset_seconds(&account.id)
+            {
+                if reset_secs > 0 {
+                    if let Some(ref mut quota_data) = account.quota {
+                        for model in &mut quota_data.models {
+                            model.percentage = 0;
+                            model.reset_time =
+                                (chrono::Utc::now().timestamp() + reset_secs as i64).to_string();
+                        }
+                        // Optionally, add a UI flag if we want it to look completely blocked
+                        // quota_data.is_forbidden = true;
+                        // quota_data.forbidden_reason = Some(format!("Quota exhausted or rate limited (resets in {}s)", reset_secs));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(accounts)
 }
 
 /// 添加账号
@@ -161,7 +194,9 @@ use crate::models::AccountExportResponse;
 
 #[tauri::command]
 pub async fn export_accounts(account_ids: Vec<String>) -> Result<AccountExportResponse, String> {
-    modules::account::export_accounts_by_ids(&account_ids)
+    tokio::task::spawn_blocking(move || modules::account::export_accounts_by_ids(&account_ids))
+        .await
+        .unwrap_or_else(|_| Err("Task panicked".to_string()))
 }
 
 /// 内部辅助功能：在添加或导入账号后自动刷新一次额度
@@ -199,7 +234,7 @@ pub async fn fetch_account_quota(
         modules::load_account(&account_id).map_err(crate::error::AppError::Account)?;
 
     // 使用带重试的查询 (Shared logic)
-    let quota = modules::account::fetch_quota_with_retry(&mut account).await?;
+    let mut quota = modules::account::fetch_quota_with_retry(&mut account).await?;
 
     // 4. 更新账号配额
     modules::update_account_quota(&account_id, quota.clone())
@@ -210,7 +245,28 @@ pub async fn fetch_account_quota(
     // 5. 同步到运行中的反代服务（如果已启动）
     let instance_lock = proxy_state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
+        // Safe check: If quota has recovered (> 0%), clear in-memory rate limit lock
+        let has_available_quota = quota.models.iter().any(|m| m.percentage > 0);
+        if has_available_quota {
+            instance.token_manager.clear_rate_limit(&account_id);
+        }
+
         let _ = instance.token_manager.reload_account(&account_id).await;
+
+        // Blend TokenManager lockout state only for models that are still 0%
+        if let Some(reset_secs) = instance
+            .token_manager
+            .get_rate_limit_reset_seconds(&account_id)
+        {
+            if reset_secs > 0 {
+                for model in &mut quota.models {
+                    if model.percentage == 0 {
+                        model.reset_time =
+                            (chrono::Utc::now().timestamp() + reset_secs as i64).to_string();
+                    }
+                }
+            }
+        }
     }
 
     Ok(quota)
@@ -380,6 +436,16 @@ pub async fn save_config(
         crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
         // [NEW] 更新全局图像思维模式配置
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
+        // [NEW] 更新全局压缩等级配置
+        crate::proxy::config::update_global_compression_level(
+            config.proxy.experimental.compression_level.clone(),
+            config.proxy.experimental.enable_usage_scaling,
+        );
+        crate::proxy::config::update_global_thresholds(
+            config.proxy.experimental.context_compression_threshold_l1,
+            config.proxy.experimental.context_compression_threshold_l2,
+            config.proxy.experimental.context_compression_threshold_l3,
+        );
         // 更新代理池配置
         instance
             .axum_server
@@ -509,24 +575,27 @@ pub async fn import_v1_accounts(
 pub async fn import_from_db(
     app: tauri::AppHandle,
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
-) -> Result<Account, String> {
-    // 同步函数包装为 async
-    let mut account = modules::migration::import_from_db().await?;
+    target_ide: Option<String>,
+) -> Result<Vec<Account>, String> {
+    let imported_accounts =
+        modules::migration::import_all_local_accounts(target_ide.as_deref()).await?;
 
-    // 既然是从数据库导入（即 IDE 当前账号），自动将其设为 Manager 的当前账号
-    let account_id = account.id.clone();
-    modules::account::set_current_account_id(&account_id)?;
+    if let Some(first_acc) = imported_accounts.first() {
+        let account_id = first_acc.id.clone();
+        let _ = modules::account::set_current_account_id_with_target(
+            &account_id,
+            target_ide.as_deref(),
+        );
+    }
 
-    // 自动触发刷新额度
-    let _ = internal_refresh_account_quota(&app, &mut account).await;
+    for mut account in imported_accounts.clone() {
+        let _ = internal_refresh_account_quota(&app, &mut account).await;
+    }
 
-    // 刷新托盘图标展示
     crate::modules::tray::update_tray_menus(&app);
-
-    // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
 
-    Ok(account)
+    Ok(imported_accounts)
 }
 
 #[tauri::command]
@@ -560,8 +629,16 @@ pub async fn sync_account_from_db(
     app: tauri::AppHandle,
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<Option<Account>, String> {
+    // Check if the current target is one we should not sync (like agy CLI)
+    let index = modules::account::load_account_index()?;
+    let current_target = index.current_target_ide.as_deref();
+    if current_target == Some("agy") {
+        modules::logger::log_info("Auto-sync skipped: current target is agy CLI");
+        return Ok(None);
+    }
+
     // 1. 获取 DB 中的 Refresh Token
-    let db_refresh_token = match modules::migration::get_refresh_token_from_db() {
+    let db_refresh_token = match modules::migration::get_refresh_token_from_db(current_target) {
         Ok(token) => token,
         Err(e) => {
             modules::logger::log_info(&format!("自动同步跳过: {}", e));
@@ -588,7 +665,21 @@ pub async fn sync_account_from_db(
     }
 
     // 4. 执行完整导入
-    let account = import_from_db(app, proxy_state).await?;
+    let mut account = modules::migration::import_from_db(current_target).await?;
+
+    // 既然是从数据库导入，自动将其设为 Manager 的当前账号并保留当前 target
+    let account_id = account.id.clone();
+    modules::account::set_current_account_id_with_target(&account_id, current_target)?;
+
+    // 自动触发刷新额度
+    let _ = internal_refresh_account_quota(&app, &mut account).await;
+
+    // 刷新托盘图标展示
+    crate::modules::tray::update_tray_menus(&app);
+
+    // Reload token pool
+    let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+
     Ok(Some(account))
 }
 
@@ -784,6 +875,27 @@ pub async fn get_antigravity_path(bypass_config: Option<bool>) -> Result<String,
     }
 }
 
+/// 获取 Antigravity CLI (agy) 可执行文件路径
+#[tauri::command]
+pub async fn get_antigravity_cli_path(bypass_config: Option<bool>) -> Result<String, String> {
+    // 1. 优先从配置查询 (除非明确要求绕过)
+    if bypass_config != Some(true) {
+        if let Ok(config) = crate::modules::config::load_app_config() {
+            if let Some(path) = config.antigravity_cli_executable {
+                if std::path::Path::new(&path).exists() {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+
+    // 2. 执行实时探测
+    match crate::modules::process::get_antigravity_cli_executable_path() {
+        Some(path) => Ok(path.to_string_lossy().to_string()),
+        None => Err("未找到 Antigravity CLI (agy) 安装路径".to_string()),
+    }
+}
+
 /// 获取 Antigravity 启动参数
 #[tauri::command]
 pub async fn get_antigravity_args() -> Result<Vec<String>, String> {
@@ -820,6 +932,14 @@ pub async fn update_last_check_time() -> Result<(), String> {
 #[tauri::command]
 pub async fn check_homebrew_installation() -> Result<bool, String> {
     Ok(crate::modules::update_checker::is_homebrew_installed())
+}
+
+/// 检测是否以 AppImage 方式运行（Linux 专用）
+/// Tauri 的原生更新器在 Linux 上只支持 AppImage，
+/// RPM/DEB 安装的用户不应触发原生自动更新以避免 ENOEXEC 错误。
+#[tauri::command]
+pub async fn check_appimage_installation() -> Result<bool, String> {
+    Ok(crate::modules::update_checker::is_appimage_running())
 }
 
 /// 通过 Homebrew Cask 升级应用
@@ -1083,4 +1203,29 @@ pub async fn get_token_stats_account_trend_daily(
     days: i64,
 ) -> Result<Vec<crate::modules::token_stats::AccountTrendPoint>, String> {
     crate::modules::token_stats::get_account_trend_daily(days)
+}
+
+#[tauri::command]
+pub async fn query_transit_info(url: String, key: String) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get(&url)
+        .bearer_auth(key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if status.is_success() {
+        Ok(text)
+    } else {
+        Err(format!("HTTP {}: {}", status, text))
+    }
 }

@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub proxy: ProxyConfig,
     pub antigravity_executable: Option<String>, // [NEW] Manually specified Antigravity executable path
     pub antigravity_ide_executable: Option<String>, // [NEW] Manually specified Antigravity IDE executable path
+    pub antigravity_cli_executable: Option<String>, // [NEW] Manually specified Antigravity CLI (agy) path
     pub antigravity_args: Option<Vec<String>>,      // [NEW] Antigravity startup arguments
     #[serde(default)]
     pub auto_launch: bool,     // Launch on startup
@@ -49,7 +50,7 @@ fn default_warmup_models() -> Vec<String> {
         "gemini-3-flash".to_string(),
         "claude".to_string(),
         "gemini-3-pro-high".to_string(),
-        "gemini-3-pro-image".to_string(),
+        "gemini-3.1-flash-image".to_string(),
     ]
 }
 
@@ -87,7 +88,7 @@ fn default_monitored_models() -> Vec<String> {
         "claude".to_string(),
         "gemini-3-pro-high".to_string(),
         "gemini-3-flash".to_string(),
-        "gemini-3-pro-image".to_string(),
+        "gemini-3.1-flash-image".to_string(),
     ]
 }
 
@@ -119,7 +120,7 @@ fn default_pinned_models() -> Vec<String> {
     vec![
         "gemini-3-pro-high".to_string(),
         "gemini-3-flash".to_string(),
-        "gemini-3-pro-image".to_string(),
+        "gemini-3.1-flash-image".to_string(),
         "claude-sonnet-4-6-thinking".to_string(),
     ]
 }
@@ -182,6 +183,7 @@ impl AppConfig {
             proxy: ProxyConfig::default(),
             antigravity_executable: None,
             antigravity_ide_executable: None,
+            antigravity_cli_executable: None,
             antigravity_args: None,
             auto_launch: false,
             scheduled_warmup: ScheduledWarmupConfig::default(),

@@ -214,13 +214,17 @@ pub fn is_antigravity_running(target_ide: Option<&str>) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-/// Get PID set of current process and all direct relatives (ancestors + descendants)
+/// Get PID set of current process and all ancestors.
+/// Only ancestors (parents/grandparents) are excluded to prevent accidentally killing
+/// the launcher or shell that started the Manager.
+/// Child processes spawned by the Manager (e.g., the IDE) must remain killable, so
+/// descendants are intentionally NOT included here.
 fn get_self_family_pids(system: &sysinfo::System) -> std::collections::HashSet<u32> {
     let current_pid = std::process::id();
     let mut family_pids = std::collections::HashSet::new();
     family_pids.insert(current_pid);
 
-    // 1. Look up all ancestors (Ancestors) - prevent killing the launcher
+    // Traverse upward to find all ancestors - prevent killing the launcher/shell
     let mut next_pid = current_pid;
     // Prevent infinite loop, max depth 10
     for _ in 0..10 {
@@ -238,29 +242,6 @@ fn get_self_family_pids(system: &sysinfo::System) -> std::collections::HashSet<u
             }
         } else {
             break;
-        }
-    }
-
-    // 2. Look down all descendants (Descendants)
-    // Build parent-child relationship map (Parent -> Children)
-    let mut adj: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-    for (pid, process) in system.processes() {
-        if let Some(parent) = process.parent() {
-            adj.entry(parent.as_u32()).or_default().push(pid.as_u32());
-        }
-    }
-
-    // BFS traversal to find all descendants
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(current_pid);
-
-    while let Some(pid) = queue.pop_front() {
-        if let Some(children) = adj.get(&pid) {
-            for &child in children {
-                if family_pids.insert(child) {
-                    queue.push_back(child);
-                }
-            }
         }
     }
 
@@ -1106,23 +1087,50 @@ pub fn get_antigravity_executable_path(target_ide: Option<&str>) -> Option<std::
         return Some(path);
     }
 
-    // Strategy 2: Check standard installation locations
+    // Strategy 2: Check config paths (supports user-configured locations)
+    if let Ok(config) = crate::modules::config::load_app_config() {
+        match target_ide {
+            Some("ide") => {
+                if let Some(ref p) = config.antigravity_ide_executable {
+                    let path = std::path::PathBuf::from(p);
+                    if path.exists() {
+                        return Some(path);
+                    }
+                }
+            }
+            _ => {
+                // Try antigravity_executable first (closest match for target_ide=None)
+                if let Some(ref p) = config.antigravity_executable {
+                    let path = std::path::PathBuf::from(p);
+                    if path.exists() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 3: Check standard installation locations
     check_standard_locations(target_ide)
 }
 
 /// Check standard installation locations
 fn check_standard_locations(target_ide: Option<&str>) -> Option<std::path::PathBuf> {
-    let folder_name = if target_ide == Some("ide") {
-        "Antigravity IDE"
+    let folder_names: &[&str] = if target_ide == Some("ide") {
+        &["Antigravity IDE"]
+    } else if target_ide == Some("code") || target_ide == Some("cursor") {
+        &["Antigravity"]
     } else {
-        "Antigravity"
+        &["Antigravity"]
     };
 
     #[cfg(target_os = "macos")]
     {
-        let path = std::path::PathBuf::from(format!("/Applications/{}.app", folder_name));
-        if path.exists() {
-            return Some(path);
+        for folder_name in folder_names {
+            let path = std::path::PathBuf::from(format!("/Applications/{}.app", folder_name));
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
 
@@ -1137,64 +1145,112 @@ fn check_standard_locations(target_ide: Option<&str>) -> Option<std::path::PathB
         let program_files_x86 =
             env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
 
-        let mut possible_paths = Vec::new();
+        for folder_name in folder_names {
+            let mut possible_paths = Vec::new();
 
-        // User installation location (preferred)
-        if let Some(local) = local_appdata {
+            // User installation location (preferred)
+            if let Some(local) = &local_appdata {
+                possible_paths.push(
+                    std::path::PathBuf::from(local)
+                        .join("Programs")
+                        .join(folder_name)
+                        .join(format!("{}.exe", folder_name)),
+                );
+            }
+
+            // System installation location
             possible_paths.push(
-                std::path::PathBuf::from(&local)
-                    .join("Programs")
+                std::path::PathBuf::from(&program_files)
                     .join(folder_name)
                     .join(format!("{}.exe", folder_name)),
             );
-        }
 
-        // System installation location
-        possible_paths.push(
-            std::path::PathBuf::from(&program_files)
-                .join(folder_name)
-                .join(format!("{}.exe", folder_name)),
-        );
+            // 32-bit compatibility location
+            possible_paths.push(
+                std::path::PathBuf::from(&program_files_x86)
+                    .join(folder_name)
+                    .join(format!("{}.exe", folder_name)),
+            );
 
-        // 32-bit compatibility location
-        possible_paths.push(
-            std::path::PathBuf::from(&program_files_x86)
-                .join(folder_name)
-                .join(format!("{}.exe", folder_name)),
-        );
-
-        // Return the first existing path
-        for path in possible_paths {
-            if path.exists() {
-                return Some(path);
+            // Return the first existing path
+            for path in possible_paths {
+                if path.exists() {
+                    return Some(path);
+                }
             }
         }
     }
 
     #[cfg(target_os = "linux")]
     {
-        let exe_name = if target_ide == Some("ide") {
-            "antigravity-ide"
-        } else {
-            "antigravity"
-        };
-        let possible_paths = vec![
-            std::path::PathBuf::from(format!("/usr/bin/{}", exe_name)),
-            std::path::PathBuf::from(format!("/opt/{}/{}", folder_name, exe_name)),
-            std::path::PathBuf::from(format!("/usr/share/{}/{}", folder_name, exe_name)),
-        ];
+        for folder_name in folder_names {
+            let exe_name = if *folder_name == "Antigravity IDE" {
+                "antigravity-ide"
+            } else {
+                "antigravity"
+            };
 
-        // User local installation
-        if let Some(home) = dirs::home_dir() {
-            let user_local = home.join(format!(".local/bin/{}", exe_name));
-            if user_local.exists() {
-                return Some(user_local);
+            let possible_paths = vec![
+                std::path::PathBuf::from(format!("/usr/bin/{}", exe_name)),
+                std::path::PathBuf::from(format!("/opt/{}/{}", folder_name, exe_name)),
+                std::path::PathBuf::from(format!("/usr/share/{}/{}", folder_name, exe_name)),
+            ];
+
+            // User local installation
+            if let Some(home) = dirs::home_dir() {
+                let user_local = home.join(format!(".local/bin/{}", exe_name));
+                if user_local.exists() {
+                    return Some(user_local);
+                }
+            }
+
+            for path in possible_paths {
+                if path.exists() {
+                    return Some(path);
+                }
             }
         }
+    }
 
-        for path in possible_paths {
+    None
+}
+
+/// 获取 Antigravity CLI (agy) 的安装/可执行文件路径
+pub fn get_antigravity_cli_executable_path() -> Option<std::path::PathBuf> {
+    // 1. 优先从配置查询
+    if let Ok(config) = crate::modules::config::load_app_config() {
+        if let Some(ref p) = config.antigravity_cli_executable {
+            let path = std::path::PathBuf::from(p);
             if path.exists() {
                 return Some(path);
+            }
+        }
+    }
+
+    // 2. 检查标准用户本地目录 ~/.local/bin/agy 或 ~/.local/bin/agy.exe
+    if let Some(home) = dirs::home_dir() {
+        let local_bin = home.join(".local").join("bin");
+        let path = if cfg!(target_os = "windows") {
+            local_bin.join("agy.exe")
+        } else {
+            local_bin.join("agy")
+        };
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // 3. 在系统环境变量 PATH 中查找
+    let cmd = if cfg!(target_os = "windows") {
+        "agy.exe"
+    } else {
+        "agy"
+    };
+    if let Ok(path_var) = std::env::var("PATH") {
+        for p in std::env::split_paths(&path_var) {
+            let p_cmd = p.join(cmd);
+            if p_cmd.exists() {
+                return Some(p_cmd);
             }
         }
     }

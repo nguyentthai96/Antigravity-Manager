@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -139,6 +139,7 @@ struct AccountResponse {
     proxy_disabled_reason: Option<String>,
     proxy_disabled_at: Option<i64>,
     protected_models: Vec<String>,
+    live_limited_models: HashMap<String, crate::models::account::LiveLimitStatus>,
     /// [NEW] 403 验证阻止状态
     validation_blocked: bool,
     validation_blocked_until: Option<i64>,
@@ -227,6 +228,7 @@ fn to_account_response(
         proxy_disabled_reason: account.proxy_disabled_reason.clone(),
         proxy_disabled_at: account.proxy_disabled_at,
         protected_models: account.protected_models.iter().cloned().collect(),
+        live_limited_models: account.live_limited_models.clone(),
         quota: account.quota.as_ref().map(|q| QuotaResponse {
             models: q
                 .models
@@ -288,9 +290,7 @@ impl AxumServer {
             *proxy = new_config.clone();
         }
         // [HOT-RELOAD] Rebuild default HTTP client with new upstream proxy
-        self.upstream
-            .rebuild_default_client(Some(new_config))
-            .await;
+        self.upstream.rebuild_default_client(Some(new_config)).await;
         // Stale per-proxy clients may also be affected (e.g. fallback path)
         self.upstream.clear_client_cache();
         tracing::info!("Upstream proxy config hot-reloaded");
@@ -440,7 +440,16 @@ impl AxumServer {
                 "/v1/completions",
                 post(handlers::openai::handle_completions),
             )
-            .route("/v1/responses", post(handlers::openai::handle_completions)) // 兼容 Codex CLI
+            .route(
+                "/v1/responses",
+                post(handlers::openai::handle_completions)
+                    .get(handlers::openai::handle_responses_websocket),
+            ) // 兼容 Codex CLI
+            .route("/responses", post(handlers::openai::handle_completions))
+            .route(
+                "/responses/compact",
+                post(handlers::openai::handle_completions),
+            )
             .route(
                 "/v1/images/generations",
                 post(handlers::openai::handle_images_generations),
@@ -578,6 +587,7 @@ impl AxumServer {
                 "/proxy/opencode/config",
                 post(admin_get_opencode_config_content),
             )
+            .route("/proxy/opencode/families", get(admin_get_opencode_families))
             .route("/proxy/droid/status", post(admin_get_droid_sync_status))
             .route("/proxy/droid/sync", post(admin_execute_droid_sync))
             .route("/proxy/droid/restore", post(admin_execute_droid_restore))
@@ -951,6 +961,7 @@ async fn admin_list_accounts(
                 proxy_disabled_reason: acc.proxy_disabled_reason,
                 proxy_disabled_at: acc.proxy_disabled_at,
                 protected_models: acc.protected_models.into_iter().collect(),
+                live_limited_models: acc.live_limited_models,
                 validation_blocked: acc.validation_blocked,
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
@@ -1031,6 +1042,7 @@ async fn admin_get_current_account(
                 proxy_disabled_reason: acc.proxy_disabled_reason,
                 proxy_disabled_at: acc.proxy_disabled_at,
                 protected_models: acc.protected_models.into_iter().collect(),
+                live_limited_models: acc.live_limited_models,
                 validation_blocked: acc.validation_blocked,
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
@@ -2807,12 +2819,15 @@ async fn admin_import_v1_accounts(
 async fn admin_import_from_db(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let account = migration::import_from_db().await.map_err(|e| {
+    let account = migration::import_from_db(None).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    // [FIX #820] 导入后清除过期的会话绑定
+    state.token_manager.clear_all_sessions();
 
     // [FIX #1166] 导入后立即加载
     let _ = state.token_manager.load_accounts().await;
@@ -2854,6 +2869,9 @@ async fn admin_import_custom_db(
             )
         })?;
 
+    // [FIX #820] 导入后清除过期的会话绑定
+    state.token_manager.clear_all_sessions();
+
     // [FIX #1166] 导入后立即加载
     let _ = state.token_manager.load_accounts().await;
 
@@ -2869,8 +2887,19 @@ async fn admin_import_custom_db(
 async fn admin_sync_account_from_db(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let index = account::load_account_index().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    let current_target = index.current_target_ide.as_deref();
+    if current_target == Some("agy") {
+        return Ok(Json(None));
+    }
+
     // 逻辑参考自 sync_account_from_db command
-    let db_refresh_token = match migration::get_refresh_token_from_db() {
+    let db_refresh_token = match migration::get_refresh_token_from_db(current_target) {
         Ok(token) => token,
         Err(_e) => {
             return Ok(Json(None));
@@ -2889,12 +2918,25 @@ async fn admin_sync_account_from_db(
         }
     }
 
-    let account = migration::import_from_db().await.map_err(|e| {
+    let account = migration::import_from_db(current_target)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+
+    let account_id = account.id.clone();
+    account::set_current_account_id_with_target(&account_id, current_target).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    // [FIX #820] 同步后清除过期的会话绑定
+    state.token_manager.clear_all_sessions();
 
     // [FIX #1166] 同步后立即重新加载 TokenManager
     let _ = state.token_manager.load_accounts().await;
@@ -3647,6 +3689,10 @@ async fn admin_get_opencode_sync_status(
         })
 }
 
+async fn admin_get_opencode_families() -> impl IntoResponse {
+    Json(crate::proxy::opencode_sync::get_canonical_families())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OpencodeSyncRequest {
@@ -3654,7 +3700,7 @@ struct OpencodeSyncRequest {
     api_key: String,
     #[serde(default)]
     sync_accounts: bool,
-    pub models: Option<Vec<String>>,
+    pub models: Option<Vec<crate::proxy::opencode_sync::ModelInput>>,
 }
 
 async fn admin_execute_opencode_sync(

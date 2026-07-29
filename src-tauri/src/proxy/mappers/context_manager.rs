@@ -3,7 +3,11 @@
 //! Responsible for estimating token usage and purifying context (stripping thinking blocks)
 //! to prevent "Prompt is too long" errors and avoid invalid signatures.
 
+use super::caveman_cleaner::CavemanCleaner;
 use super::claude::models::{ClaudeRequest, ContentBlock, Message, MessageContent, SystemPrompt};
+use super::openai::models::{OpenAIMessage, OpenAIRequest};
+use super::rtk_cleaner::RtkCleaner;
+use serde_json::{json, Value};
 use tracing::{debug, info};
 
 /// Helper to estimate tokens from text with multi-language awareness
@@ -36,6 +40,94 @@ fn estimate_tokens_from_str(s: &str) -> u32 {
     ((ascii_tokens + unicode_tokens) as f32 * 1.15).ceil() as u32
 }
 
+/// Estimate token cost for an image from an OpenAI-format image_url.
+/// Handles both base64 data URLs and remote URLs.
+/// Gemini counts standard images at ~258 tokens. For very large images
+/// (>1MB base64 payload), we scale up since high-res images tokenize higher.
+fn estimate_image_tokens_from_url(url: &str) -> u32 {
+    const BASE_IMAGE_TOKENS: u32 = 258;
+
+    if url.starts_with("data:") {
+        // data:image/png;base64,<data>
+        // Extract the base64 portion after the comma
+        if let Some(comma_pos) = url.find(',') {
+            let base64_len = url.len() - comma_pos - 1;
+            // Approximate raw bytes: base64 encodes 3 bytes into 4 chars
+            let raw_bytes = (base64_len * 3) / 4;
+
+            // Gemini: standard images = 258 tokens
+            // High-res images (>1MB) scale higher, up to ~10k tokens for very large ones
+            if raw_bytes > 4_000_000 {
+                // >4MB: very high resolution
+                10_000
+            } else if raw_bytes > 1_000_000 {
+                // 1-4MB: high resolution, scale linearly
+                let factor = raw_bytes as f32 / 1_000_000.0;
+                (BASE_IMAGE_TOKENS as f32 * factor * 4.0).ceil() as u32
+            } else {
+                BASE_IMAGE_TOKENS
+            }
+        } else {
+            BASE_IMAGE_TOKENS
+        }
+    } else {
+        // Remote URL: assume standard resolution
+        BASE_IMAGE_TOKENS
+    }
+}
+
+/// Estimate token cost for audio from a URL.
+/// Audio is tokenized at roughly 32 tokens per second.
+/// From base64, we estimate duration from payload size.
+fn estimate_media_tokens_from_url(url: &str) -> u32 {
+    const BASE_AUDIO_TOKENS: u32 = 500; // ~15 seconds default
+
+    if url.starts_with("data:") {
+        if let Some(comma_pos) = url.find(',') {
+            let base64_len = url.len() - comma_pos - 1;
+            let raw_bytes = (base64_len * 3) / 4;
+            // Rough estimate: 16kHz, 16-bit mono audio ≈ 32KB/s
+            // 32 tokens/second
+            let estimated_seconds = raw_bytes as f32 / 32_000.0;
+            let tokens = (estimated_seconds * 32.0).ceil() as u32;
+            tokens.max(64) // minimum 64 tokens for any audio
+        } else {
+            BASE_AUDIO_TOKENS
+        }
+    } else {
+        BASE_AUDIO_TOKENS
+    }
+}
+
+/// Estimate token cost for Gemini inlineData (base64 images/audio in Gemini format).
+/// mime_type determines the estimation strategy. data_len is the length of the base64 string.
+fn estimate_inline_data_tokens(mime_type: &str, data_len: usize) -> u32 {
+    if mime_type.starts_with("image/") {
+        // Same logic as estimate_image_tokens_from_url for base64
+        let raw_bytes = (data_len * 3) / 4;
+        if raw_bytes > 4_000_000 {
+            10_000
+        } else if raw_bytes > 1_000_000 {
+            let factor = raw_bytes as f32 / 1_000_000.0;
+            (258.0 * factor * 4.0).ceil() as u32
+        } else {
+            258
+        }
+    } else if mime_type.starts_with("audio/") {
+        let raw_bytes = (data_len * 3) / 4;
+        let estimated_seconds = raw_bytes as f32 / 32_000.0;
+        (estimated_seconds * 32.0).ceil().max(64.0) as u32
+    } else if mime_type.starts_with("video/") {
+        // Video: very expensive, rough estimate
+        let raw_bytes = (data_len * 3) / 4;
+        let estimated_seconds = raw_bytes as f32 / 500_000.0; // rough video bitrate
+        (estimated_seconds * 300.0).ceil().max(258.0) as u32 // ~300 tokens/sec for video
+    } else {
+        // Unknown media: treat as text approximation
+        estimate_tokens_from_str(&format!("[binary data: {} bytes]", data_len))
+    }
+}
+
 /// Strategy for context purification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurificationStrategy {
@@ -60,7 +152,90 @@ impl ContextManager {
             PurificationStrategy::Aggressive => 0, // No protection
         };
 
-        Self::strip_thinking_blocks(messages, protected_last_n)
+        let mut modified = Self::strip_thinking_blocks(messages, protected_last_n);
+
+        // Apply Caveman cleaning to older message contents to save tokens
+        let total_msgs = messages.len();
+        let start_protection_idx = total_msgs.saturating_sub(protected_last_n);
+        for (i, msg) in messages.iter_mut().enumerate() {
+            if i >= start_protection_idx {
+                continue;
+            }
+            if msg.role == "user" || msg.role == "assistant" {
+                match &mut msg.content {
+                    MessageContent::String(s) => {
+                        let cleaned = CavemanCleaner::clean(s);
+                        if cleaned != *s {
+                            *s = cleaned;
+                            modified = true;
+                        }
+                    }
+                    MessageContent::Array(blocks) => {
+                        for block in blocks {
+                            if let ContentBlock::Text { text } = block {
+                                let cleaned = CavemanCleaner::clean(text);
+                                if cleaned != *text {
+                                    *text = cleaned;
+                                    modified = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        modified
+    }
+
+    /// Clean tool result messages using RtkCleaner
+    pub fn clean_tool_message(msg: &mut Message) -> bool {
+        let mut modified = false;
+        if let MessageContent::Array(blocks) = &mut msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    if let Some(s) = content.as_str() {
+                        let cleaned = RtkCleaner::clean(s, 48);
+                        if cleaned != s {
+                            *content = serde_json::Value::String(cleaned);
+                            modified = true;
+                        }
+                    }
+                }
+            }
+        }
+        modified
+    }
+
+    /// Clean OpenAI tool message using RtkCleaner
+    pub fn clean_openai_tool_message(msg: &mut OpenAIMessage) -> bool {
+        if msg.role == "tool" {
+            if let Some(ref mut content) = msg.content {
+                match content {
+                    crate::proxy::mappers::openai::models::OpenAIContent::String(s) => {
+                        let cleaned = RtkCleaner::clean(s, 48);
+                        if cleaned != *s {
+                            *s = cleaned;
+                            return true;
+                        }
+                    }
+                    crate::proxy::mappers::openai::models::OpenAIContent::Array(blocks) => {
+                        let mut modified = false;
+                        for block in blocks {
+                            if let crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } = block {
+                                let cleaned = RtkCleaner::clean(text, 48);
+                                if cleaned != *text {
+                                    *text = cleaned;
+                                    modified = true;
+                                }
+                            }
+                        }
+                        return modified;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Internal helper to strip thinking blocks from messages outside the protected range
@@ -309,6 +484,11 @@ impl ContextManager {
         None
     }
 
+    /// Extract last valid signature for OpenAI using SignatureCache
+    pub fn extract_last_openai_valid_signature(session_id: &str) -> Option<String> {
+        crate::proxy::signature_cache::SignatureCache::global().get_session_signature(session_id)
+    }
+
     // ===== [Layer 1] Tool Message Intelligent Trimming =====
     // Borrowed from Practical-Guide-to-Context-Engineering
     // This layer removes old tool call/result pairs while preserving recent ones
@@ -323,9 +503,17 @@ impl ContextManager {
     /// Returns true if any messages were removed
     pub fn trim_tool_messages(messages: &mut Vec<Message>, keep_last_n_rounds: usize) -> bool {
         let tool_rounds = identify_tool_rounds(messages);
+        let mut modified = false;
+
+        // Clean retained tool messages using RtkCleaner
+        for msg in messages.iter_mut() {
+            if Self::clean_tool_message(msg) {
+                modified = true;
+            }
+        }
 
         if tool_rounds.len() <= keep_last_n_rounds {
-            return false; // No trimming needed
+            return modified; // No trimming needed, but might have cleaned some messages
         }
 
         // Identify indices to remove (older rounds)
@@ -354,6 +542,145 @@ impl ContextManager {
             );
         }
 
+        removed_count > 0
+    }
+
+    /// Restore reasoning text for assistant messages from cache in OpenAI format
+    pub fn restore_openai_reasoning_content(messages: &mut Vec<OpenAIMessage>, session_id: &str) {
+        let mut assistant_turn_count = 0;
+        for msg in messages.iter_mut() {
+            if msg.role == "assistant" {
+                let is_missing = msg
+                    .reasoning_content
+                    .as_ref()
+                    .map(|s| s.is_empty() || s == "[undefined]")
+                    .unwrap_or(true);
+
+                if is_missing {
+                    if let Some(cached_reasoning) = crate::proxy::SignatureCache::global()
+                        .get_session_reasoning(session_id, assistant_turn_count)
+                    {
+                        tracing::debug!(
+                            "[OpenAI-Reasoning] Restored reasoning for assistant turn {} (len: {})",
+                            assistant_turn_count,
+                            cached_reasoning.len()
+                        );
+                        msg.reasoning_content = Some(cached_reasoning);
+                    }
+                }
+                assistant_turn_count += 1;
+            }
+        }
+    }
+
+    /// Purify reasoning text in OpenAI history to save tokens
+    pub fn purify_openai_history(
+        messages: &mut Vec<OpenAIMessage>,
+        strategy: PurificationStrategy,
+    ) -> bool {
+        let protected_last_n = match strategy {
+            PurificationStrategy::Soft => 4, // Keep thinking for recent 4 messages (approx 2 turns)
+            PurificationStrategy::Aggressive => 0,
+        };
+        let total_msgs = messages.len();
+        if total_msgs == 0 {
+            return false;
+        }
+        let start_protection_idx = total_msgs.saturating_sub(protected_last_n);
+        let mut modified = false;
+
+        for (i, msg) in messages.iter_mut().enumerate() {
+            if i >= start_protection_idx {
+                continue;
+            }
+            if msg.role == "assistant" && msg.reasoning_content.is_some() {
+                // [FIX] If the assistant message contains tool calls, do NOT strip its reasoning_content/signature.
+                // Otherwise, the signature chain is broken, and Google API throws a 400 thought_signature error for historical tool calls.
+                let has_tool_calls = msg
+                    .tool_calls
+                    .as_ref()
+                    .map(|tc| !tc.is_empty())
+                    .unwrap_or(false);
+                if !has_tool_calls {
+                    tracing::debug!(
+                        "[ContextManager] Purifying reasoning_content of message {} (len: {})",
+                        i,
+                        msg.reasoning_content.as_ref().unwrap().len()
+                    );
+                    msg.reasoning_content = None;
+                    modified = true;
+                }
+            }
+            if msg.role == "user" || msg.role == "assistant" {
+                if let Some(ref mut content) = msg.content {
+                    match content {
+                        crate::proxy::mappers::openai::models::OpenAIContent::String(s) => {
+                            let cleaned = CavemanCleaner::clean(s);
+                            if cleaned != *s {
+                                *s = cleaned;
+                                modified = true;
+                            }
+                        }
+                        crate::proxy::mappers::openai::models::OpenAIContent::Array(blocks) => {
+                            for block in blocks {
+                                if let crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } = block {
+                                    let cleaned = CavemanCleaner::clean(text);
+                                    if cleaned != *text {
+                                        *text = cleaned;
+                                        modified = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        modified
+    }
+
+    /// Trim old tool messages in OpenAI format, keeping only the last N rounds
+    pub fn trim_openai_tool_messages(
+        messages: &mut Vec<OpenAIMessage>,
+        keep_last_n_rounds: usize,
+    ) -> bool {
+        let tool_rounds = identify_openai_tool_rounds(messages);
+        let mut modified = false;
+
+        // Clean retained tool messages using RtkCleaner
+        for msg in messages.iter_mut() {
+            if Self::clean_openai_tool_message(msg) {
+                modified = true;
+            }
+        }
+
+        if tool_rounds.len() <= keep_last_n_rounds {
+            return modified;
+        }
+
+        let rounds_to_remove = tool_rounds.len() - keep_last_n_rounds;
+        let mut indices_to_remove = std::collections::HashSet::new();
+
+        for round in tool_rounds.iter().take(rounds_to_remove) {
+            for idx in &round.indices {
+                indices_to_remove.insert(*idx);
+            }
+        }
+
+        let mut removed_count = 0;
+        for idx in (0..messages.len()).rev() {
+            if indices_to_remove.contains(&idx) {
+                messages.remove(idx);
+                removed_count += 1;
+            }
+        }
+
+        if removed_count > 0 {
+            info!(
+                "[ContextManager] [OpenAI] Trimmed {} tool messages, kept last {} rounds",
+                removed_count, keep_last_n_rounds
+            );
+        }
         removed_count > 0
     }
 }
@@ -416,6 +743,46 @@ fn identify_tool_rounds(messages: &[Message]) -> Vec<ToolRound> {
     rounds
 }
 
+struct OpenAIToolRound {
+    _assistant_index: usize,
+    _tool_indices: Vec<usize>,
+    indices: Vec<usize>,
+}
+
+fn identify_openai_tool_rounds(messages: &[OpenAIMessage]) -> Vec<OpenAIToolRound> {
+    let mut rounds = Vec::new();
+    let mut current_round: Option<OpenAIToolRound> = None;
+
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.role == "assistant"
+            && msg.tool_calls.is_some()
+            && !msg.tool_calls.as_ref().unwrap().is_empty()
+        {
+            if let Some(round) = current_round.take() {
+                rounds.push(round);
+            }
+            current_round = Some(OpenAIToolRound {
+                _assistant_index: i,
+                _tool_indices: Vec::new(),
+                indices: vec![i],
+            });
+        } else if msg.role == "tool" || msg.role == "function" || msg.tool_call_id.is_some() {
+            if let Some(ref mut round) = current_round {
+                round._tool_indices.push(i);
+                round.indices.push(i);
+            }
+        } else if msg.role == "user" {
+            if let Some(round) = current_round.take() {
+                rounds.push(round);
+            }
+        }
+    }
+    if let Some(round) = current_round {
+        rounds.push(round);
+    }
+    rounds
+}
+
 /// Check if message content contains tool_use
 fn has_tool_use(content: &MessageContent) -> bool {
     if let MessageContent::Array(blocks) = content {
@@ -437,7 +804,359 @@ fn has_tool_result(content: &MessageContent) -> bool {
         false
     }
 }
+impl ContextManager {
+    /// Estimate token usage for an OpenAI Request
+    pub fn estimate_openai_token_usage(request: &OpenAIRequest) -> u32 {
+        let mut total = 0;
 
+        // System or developer messages, tools definitions, prompt
+        if let Some(prompt) = &request.prompt {
+            total += estimate_tokens_from_str(prompt);
+        }
+        if let Some(instructions) = &request.instructions {
+            total += estimate_tokens_from_str(instructions);
+        }
+
+        for msg in &request.messages {
+            total += 4; // msg overhead
+
+            if let Some(ref content) = msg.content {
+                match content {
+                    crate::proxy::mappers::openai::models::OpenAIContent::String(s) => {
+                        total += estimate_tokens_from_str(s);
+                    }
+                    crate::proxy::mappers::openai::models::OpenAIContent::Array(blocks) => {
+                        for block in blocks {
+                            match block {
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } => {
+                                    total += estimate_tokens_from_str(text);
+                                }
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::ImageUrl { image_url } => {
+                                    // Gemini counts images at ~258 tokens for standard resolution.
+                                    // For base64 data URLs, estimate higher based on payload size
+                                    // since very large images can consume significantly more tokens.
+                                    total += estimate_image_tokens_from_url(&image_url.url);
+                                }
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::AudioUrl { audio_url } => {
+                                    // Audio is tokenized at ~32 tokens per second (~25 bytes/token from base64)
+                                    total += estimate_media_tokens_from_url(&audio_url.url);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref reasoning) = msg.reasoning_content {
+                total += estimate_tokens_from_str(reasoning);
+                total += 100; // signature/thinking overhead
+            }
+
+            if let Some(ref tool_calls) = msg.tool_calls {
+                for tc in tool_calls {
+                    total += 20;
+                    if let Some(ref func) = tc.function {
+                        total += estimate_tokens_from_str(&func.name);
+                        total += estimate_tokens_from_str(&func.arguments);
+                    }
+                }
+            }
+
+            if let Some(ref name) = msg.name {
+                total += estimate_tokens_from_str(name);
+            }
+        }
+
+        if let Some(tools) = &request.tools {
+            for tool in tools {
+                if let Ok(json_str) = serde_json::to_string(tool) {
+                    total += estimate_tokens_from_str(&json_str);
+                }
+            }
+        }
+
+        if let Some(thinking) = &request.thinking {
+            if let Some(budget) = thinking.budget_tokens {
+                total += budget;
+            }
+        }
+
+        total
+    }
+
+    /// Compress thinking content in OpenAI request while keeping it in a lightweight representation
+    pub fn compress_openai_thinking_preserve_signature(
+        messages: &mut Vec<OpenAIMessage>,
+        protected_last_n: usize,
+    ) -> bool {
+        let total_msgs = messages.len();
+        if total_msgs == 0 {
+            return false;
+        }
+
+        let start_protection_idx = total_msgs.saturating_sub(protected_last_n);
+        let mut compressed_count = 0;
+
+        for (i, msg) in messages.iter_mut().enumerate() {
+            if i >= start_protection_idx {
+                continue;
+            }
+
+            if msg.role == "assistant" {
+                if let Some(ref mut reasoning) = msg.reasoning_content {
+                    // [FIX] If the assistant message contains tool calls, do NOT strip its reasoning_content/signature.
+                    let has_tool_calls = msg
+                        .tool_calls
+                        .as_ref()
+                        .map(|tc| !tc.is_empty())
+                        .unwrap_or(false);
+                    if !has_tool_calls && reasoning.len() > 10 {
+                        *reasoning = "...".to_string();
+                        compressed_count += 1;
+                    }
+                }
+            }
+        }
+
+        compressed_count > 0
+    }
+
+    /// Estimate token usage for a Gemini Request represented as serde_json::Value
+    pub fn estimate_gemini_token_usage(body: &Value) -> u32 {
+        let mut total = 0;
+
+        // systemInstruction
+        if let Some(sys_inst) = body.get("systemInstruction") {
+            if let Some(parts) = sys_inst.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        total += estimate_tokens_from_str(text);
+                    }
+                }
+            }
+        }
+
+        // contents
+        if let Some(contents) = body.get("contents").and_then(|c| c.as_array()) {
+            for msg in contents {
+                total += 4; // msg overhead
+                if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            total += estimate_tokens_from_str(text);
+                        }
+                        if let Some(thought) = part.get("thought").and_then(|t| t.as_bool()) {
+                            if thought {
+                                total += 100; // thinking overhead
+                            }
+                        }
+                        // inlineData: base64-encoded images/audio embedded in the request
+                        if let Some(inline_data) = part.get("inlineData") {
+                            let mime = inline_data
+                                .get("mimeType")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("");
+                            let data_len = inline_data
+                                .get("data")
+                                .and_then(|d| d.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            total += estimate_inline_data_tokens(mime, data_len);
+                        }
+                        if let Some(fc) = part.get("functionCall") {
+                            total += 20;
+                            if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
+                                total += estimate_tokens_from_str(name);
+                            }
+                            if let Some(args) = fc.get("args") {
+                                if let Ok(json_str) = serde_json::to_string(args) {
+                                    total += estimate_tokens_from_str(&json_str);
+                                }
+                            }
+                        }
+                        if let Some(fr) = part.get("functionResponse") {
+                            total += 10;
+                            if let Some(name) = fr.get("name").and_then(|n| n.as_str()) {
+                                total += estimate_tokens_from_str(name);
+                            }
+                            if let Some(resp) = fr.get("response") {
+                                if let Ok(json_str) = serde_json::to_string(resp) {
+                                    total += estimate_tokens_from_str(&json_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // tools
+        if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+            for tool in tools {
+                if let Ok(json_str) = serde_json::to_string(tool) {
+                    total += estimate_tokens_from_str(&json_str);
+                }
+            }
+        }
+
+        total
+    }
+
+    /// Trim old tool messages in Gemini request body, keeping only the last N rounds
+    pub fn trim_gemini_tool_messages(body: &mut Value, keep_last_n_rounds: usize) -> bool {
+        if let Some(contents) = body.get_mut("contents").and_then(|c| c.as_array_mut()) {
+            let mut tool_rounds = Vec::new();
+            let mut current_round: Option<OpenAIToolRound> = None;
+
+            for (i, msg) in contents.iter().enumerate() {
+                let role = msg
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("unknown");
+                let has_function_call = msg
+                    .get("parts")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| arr.iter().any(|part| part.get("functionCall").is_some()))
+                    .unwrap_or(false);
+                let has_function_response = msg
+                    .get("parts")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .any(|part| part.get("functionResponse").is_some())
+                    })
+                    .unwrap_or(false);
+
+                if role == "model" && has_function_call {
+                    if let Some(round) = current_round.take() {
+                        tool_rounds.push(round);
+                    }
+                    current_round = Some(OpenAIToolRound {
+                        _assistant_index: i,
+                        _tool_indices: Vec::new(),
+                        indices: vec![i],
+                    });
+                } else if role == "user" && has_function_response {
+                    if let Some(ref mut round) = current_round {
+                        round._tool_indices.push(i);
+                        round.indices.push(i);
+                    }
+                } else if role == "user" {
+                    if let Some(round) = current_round.take() {
+                        tool_rounds.push(round);
+                    }
+                }
+            }
+            if let Some(round) = current_round {
+                tool_rounds.push(round);
+            }
+
+            // 对保留下来的工具消息部分进行 RTK 日志降噪 (就地修改)
+            for msg in contents.iter_mut() {
+                if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                    for part in parts {
+                        if let Some(fr) = part.get_mut("functionResponse") {
+                            if let Some(resp_obj) =
+                                fr.get_mut("response").and_then(|r| r.as_object_mut())
+                            {
+                                for (_key, val) in resp_obj.iter_mut() {
+                                    if let Some(s) = val.as_str() {
+                                        let cleaned = RtkCleaner::clean(s, 48);
+                                        if cleaned != s {
+                                            *val = json!(cleaned);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if tool_rounds.len() <= keep_last_n_rounds {
+                return false;
+            }
+
+            let rounds_to_remove = tool_rounds.len() - keep_last_n_rounds;
+            let mut indices_to_remove = std::collections::HashSet::new();
+
+            for round in tool_rounds.iter().take(rounds_to_remove) {
+                for idx in &round.indices {
+                    indices_to_remove.insert(*idx);
+                }
+            }
+
+            let mut removed_count = 0;
+            for idx in (0..contents.len()).rev() {
+                if indices_to_remove.contains(&idx) {
+                    contents.remove(idx);
+                    removed_count += 1;
+                }
+            }
+
+            if removed_count > 0 {
+                info!(
+                    "[ContextManager] [Gemini] Trimmed {} tool messages, kept last {} rounds",
+                    removed_count, keep_last_n_rounds
+                );
+            }
+            removed_count > 0
+        } else {
+            false
+        }
+    }
+
+    /// Compress thinking in Gemini request body, keeping it in a lightweight representation
+    pub fn compress_gemini_thinking_preserve_signature(
+        body: &mut Value,
+        protected_last_n: usize,
+    ) -> bool {
+        if let Some(contents) = body.get_mut("contents").and_then(|c| c.as_array_mut()) {
+            let total_turns = contents.len();
+            if total_turns == 0 {
+                return false;
+            }
+
+            let start_protection_idx = total_turns.saturating_sub(protected_last_n);
+            let mut compressed_count = 0;
+
+            for (i, msg) in contents.iter_mut().enumerate() {
+                if i >= start_protection_idx {
+                    continue;
+                }
+
+                let role = msg
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("unknown");
+                if role == "model" {
+                    if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                        for part in parts {
+                            if let Some(obj) = part.as_object_mut() {
+                                if let Some(thought) = obj.get("thought").and_then(|t| t.as_bool())
+                                {
+                                    if thought {
+                                        if let Some(text) =
+                                            obj.get_mut("text").and_then(|t| t.as_str())
+                                        {
+                                            if text.len() > 10 {
+                                                obj.insert("text".to_string(), json!("..."));
+                                                compressed_count += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            compressed_count > 0
+        } else {
+            false
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

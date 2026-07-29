@@ -26,7 +26,9 @@ pub fn resolve_request_config(
     body: Option<&Value>,     // [NEW] Request body for Gemini native imageConfig
 ) -> RequestConfig {
     // 1. Image Generation Check (Priority)
-    if mapped_model.starts_with("gemini-3-pro-image") {
+    // Detect via the original requested alias OR the account-resolved model name, because the
+    // dynamic model rewrite may turn "gemini-3-pro-image" into e.g. "gemini-3.1-flash-image".
+    if original_model.to_lowercase().contains("-image") || mapped_model.contains("-image") {
         // [RESOLVE #1694] Improved priority logic:
         // 1. First parse inferred config from model suffix and OpenAI parameters
         let (mut inferred_config, parsed_base_model) =
@@ -68,10 +70,17 @@ pub fn resolve_request_config(
             inferred_config
         );
 
+        // Prefer the account-resolved concrete image model (mapped_model) for the upstream
+        // call; fall back to the parsed base of the requested alias if it wasn't resolved.
+        let upstream_model = if mapped_model.contains("-image") {
+            mapped_model.to_string()
+        } else {
+            parsed_base_model
+        };
         return RequestConfig {
             request_type: "image_gen".to_string(),
             inject_google_search: false,
-            final_model: parsed_base_model,
+            final_model: upstream_model,
             image_config: Some(inferred_config),
         };
     }
@@ -92,6 +101,11 @@ pub fn resolve_request_config(
         || mapped_model.starts_with("gemini-2.0-flash")
         || mapped_model.starts_with("gemini-3-")
         || mapped_model.starts_with("gemini-3.")
+        || mapped_model.starts_with("gemini-3.5-")
+        || mapped_model.starts_with("gemini-pro-")
+        || mapped_model.starts_with("gemini-3-flash")
+        || mapped_model.starts_with("gemini-3.5-flash")
+        || mapped_model.starts_with("agent")
         || mapped_model.contains("claude-3-5-sonnet")
         || mapped_model.contains("claude-3-opus")
         || mapped_model.contains("claude-sonnet")
@@ -874,4 +888,124 @@ mod tests {
         assert_eq!(config_3["imageSize"], "4K");
         assert_eq!(config_3["aspectRatio"], "16:9");
     }
+}
+
+pub fn sanitize_system_prompt_for_tokens(text: &str) -> String {
+    use regex::Regex;
+    let mut cleaned = text.to_string();
+
+    // [CACHE] Step 1: 剥离动态内容（时间戳、UUID），确保跨请求的前缀一致性
+    // 这对 Gemini 隐式前缀缓存命中至关重要
+    let time_patterns = [
+        r"(?im)^Current (date|time)(\s+is)?\s*:.*$",
+        r"(?im)^Today is\s*:.*$",
+        r"(?im)^Date:\s+\d{4}-\d{2}-\d{2}.*$",
+    ];
+    for pat in &time_patterns {
+        if let Ok(re) = Regex::new(pat) {
+            cleaned = re.replace_all(&cleaned, "").into_owned();
+        }
+    }
+
+    // 剥离 UUID
+    if let Ok(re) = Regex::new(r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b")
+    {
+        cleaned = re.replace_all(&cleaned, "{uuid}").into_owned();
+    }
+
+    // 剥离随机 request/session/trace ID
+    if let Ok(re) = Regex::new(r"\b(req|sid|trace)_[a-f0-9]{6,32}\b") {
+        cleaned = re.replace_all(&cleaned, "{id}").into_owned();
+    }
+
+    // Step 2: Compress massive XML tags injected by thick clients to save tokens
+
+    let tags_to_compress = [
+        "skills_instructions",
+        "skills",
+        "plugins",
+        "subagents",
+        "customizations",
+        "conversation_transcript",
+        "guidelines",
+    ];
+
+    for tag in tags_to_compress.iter() {
+        let pattern = format!(r"(?s)<{}>.*?</{}>", tag, tag);
+        if let Ok(re) = Regex::new(&pattern) {
+            let replacement = format!("<{}>\n[Omitted by Antigravity Proxy to save tokens. Tool definitions remain available.]\n</{}>", tag, tag);
+            cleaned = re.replace_all(&cleaned, replacement).into_owned();
+        }
+    }
+
+    cleaned
+}
+
+/// [FIX] Parse markdown base64 images from text and split into Gemini parts
+/// This prevents base64 reflection bloat where generated images are sent back as huge text strings
+pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
+    let mut parts = Vec::new();
+    // Match ![...](data:image/...;base64,...)
+    if let Ok(re) = regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)") {
+        let mut last_match = 0;
+
+        for cap in re.captures_iter(text) {
+            let m = cap.get(0).unwrap();
+
+            // Add preceding text
+            if m.start() > last_match {
+                let preceding = &text[last_match..m.start()];
+                if !preceding.trim().is_empty() {
+                    parts.push(json!({"text": preceding}));
+                }
+            }
+
+            // Add inlineData image
+            let mime = cap.get(1).unwrap().as_str();
+            let b64 = cap.get(2).unwrap().as_str();
+            parts.push(json!({
+                "inlineData": { "mimeType": mime, "data": b64 }
+            }));
+
+            last_match = m.end();
+        }
+
+        // Add remaining text
+        if last_match < text.len() {
+            let remaining = &text[last_match..];
+            if !remaining.trim().is_empty() {
+                parts.push(json!({"text": remaining}));
+            }
+        }
+
+        if parts.is_empty() && !text.trim().is_empty() {
+            parts.push(json!({"text": text}));
+        }
+
+        return parts;
+    }
+
+    if !text.trim().is_empty() {
+        parts.push(json!({"text": text}));
+    }
+
+    parts
+}
+
+/// [FIX] Inject explicit tool mapping instructions for Gemini to read SKILL.md
+pub fn enhance_gemini_skills_prompt(text: &str) -> String {
+    let mut enhanced = text.to_string();
+    let warning_note = "\n\n**[CRITICAL INSTRUCTION FOR GEMINI - HOW TO READ SKILL.md]**\nYou do NOT have a direct `view_file` or `read_file` tool.\nTo \"open and read its SKILL.md completely\" as instructed above, you MUST use the `shell_command` tool.\nFor example, run the following command in PowerShell:\n`Get-Content -Raw -Path \"C:\\Users\\...\\SKILL.md\"`\nDo NOT guess other non-existent reading tools. You must use `shell_command`!\n\n";
+
+    // Inject before </skills_instructions> or </skills>
+    if enhanced.contains("</skills_instructions>") {
+        enhanced = enhanced.replace(
+            "</skills_instructions>",
+            &format!("{}</skills_instructions>", warning_note),
+        );
+    } else if enhanced.contains("</skills>") {
+        enhanced = enhanced.replace("</skills>", &format!("{}</skills>", warning_note));
+    }
+
+    enhanced
 }

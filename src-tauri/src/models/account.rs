@@ -1,6 +1,17 @@
 use super::{quota::QuotaData, token::TokenData};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveLimitStatus {
+    pub model: String,
+    pub status: u16,
+    pub reason: String,
+    pub until: i64,
+    pub detected_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
 
 /// 账号数据结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +48,9 @@ pub struct Account {
     /// 受配额保护禁用的模型列表 [NEW #621]
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub protected_models: HashSet<String>,
+    /// Temporary live upstream throttles observed from actual generation requests.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub live_limited_models: HashMap<String, LiveLimitStatus>,
     /// [NEW] 403 验证阻止状态 (VALIDATION_REQUIRED)
     #[serde(default)]
     pub validation_blocked: bool,
@@ -80,6 +94,7 @@ impl Account {
             proxy_disabled_reason: None,
             proxy_disabled_at: None,
             protected_models: HashSet::new(),
+            live_limited_models: HashMap::new(),
             validation_blocked: false,
             validation_blocked_until: None,
             validation_blocked_reason: None,
@@ -96,7 +111,12 @@ impl Account {
         self.last_used = chrono::Utc::now().timestamp();
     }
 
-    pub fn update_quota(&mut self, quota: QuotaData) {
+    pub fn update_quota(&mut self, mut quota: QuotaData) {
+        if let Some(ref existing) = self.quota {
+            if quota.subscription_tier.is_none() {
+                quota.subscription_tier = existing.subscription_tier.clone();
+            }
+        }
         self.quota = Some(quota);
     }
 }
@@ -107,6 +127,8 @@ pub struct AccountIndex {
     pub version: String,
     pub accounts: Vec<AccountSummary>,
     pub current_account_id: Option<String>,
+    #[serde(default)]
+    pub current_target_ide: Option<String>,
 }
 
 /// 账号摘要信息
@@ -132,6 +154,7 @@ impl AccountIndex {
             version: "2.0".to_string(),
             accounts: Vec::new(),
             current_account_id: None,
+            current_target_ide: None,
         }
     }
 }

@@ -26,6 +26,7 @@ interface ProxyRequestLog {
     response_body?: string;
     input_tokens?: number;
     output_tokens?: number;
+    cached_tokens?: number;
     account_email?: string;
     protocol?: string;  // "openai" | "anthropic" | "gemini"
 }
@@ -107,8 +108,8 @@ const LogTable: React.FC<LogTableProps> = ({
                             </td>
                             <td className="truncate" style={{ width: '180px', maxWidth: '180px' }}>{log.url}</td>
                             <td className="text-right text-[9px]" style={{ width: '90px' }}>
-                                {log.input_tokens != null && <div>I: {formatCompactNumber(log.input_tokens)}</div>}
-                                {log.output_tokens != null && <div>O: {formatCompactNumber(log.output_tokens)}</div>}
+                                {log.input_tokens != null && <div>{t('monitor.input')}: {formatCompactNumber(log.input_tokens)}</div>}
+                                {log.output_tokens != null && <div>{t('monitor.output')}: {formatCompactNumber(log.output_tokens)}</div>}
                             </td>
                             <td className="text-right" style={{ width: '80px' }}>{log.duration}ms</td>
                             <td className="text-right text-[10px]" style={{ width: '80px' }}>
@@ -319,7 +320,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
                 // 防抖:每 500ms 批量更新一次
                 if (updateTimeout) clearTimeout(updateTimeout);
-                updateTimeout = setTimeout(async () => {
+                updateTimeout = window.setTimeout(async () => {
                     if (!isMountedRef.current) return;
 
                     const currentPending = pendingLogsRef.current;

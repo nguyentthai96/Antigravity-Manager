@@ -7,12 +7,244 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::Value;
 use std::time::Instant;
 
 const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
 const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB for image responses
+const MAX_LOGGED_FIELD_CHARS: usize = 500;
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn extract_quoted_param(header: &str, key: &str) -> Option<String> {
+    let needle = format!("{}=\"", key);
+    let start = header.find(&needle)? + needle.len();
+    let rest = &header[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_boundary(content_type: &str) -> Option<String> {
+    content_type.split(';').find_map(|part| {
+        let trimmed = part.trim();
+        let value = trimmed.strip_prefix("boundary=")?;
+        Some(value.trim_matches('"').to_string())
+    })
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() || start >= haystack.len() {
+        return None;
+    }
+    haystack[start..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|idx| start + idx)
+}
+
+fn trim_part_tail(mut part: &[u8]) -> &[u8] {
+    if part.ends_with(b"\r\n") {
+        part = &part[..part.len() - 2];
+    } else if part.ends_with(b"\n") {
+        part = &part[..part.len() - 1];
+    }
+    part
+}
+
+fn summarize_multipart_request(
+    bytes: &[u8],
+    content_type: &str,
+    uri: &str,
+) -> Option<(String, Option<String>)> {
+    let boundary = extract_boundary(content_type)?;
+    let marker = format!("--{}", boundary).into_bytes();
+    let mut cursor = find_subslice(bytes, &marker, 0)?;
+    let mut fields = serde_json::Map::new();
+    let mut files = Vec::new();
+    let mut model = None;
+
+    loop {
+        cursor += marker.len();
+        if cursor >= bytes.len() || bytes[cursor..].starts_with(b"--") {
+            break;
+        }
+        if bytes[cursor..].starts_with(b"\r\n") {
+            cursor += 2;
+        } else if bytes[cursor..].starts_with(b"\n") {
+            cursor += 1;
+        }
+
+        let Some(next_boundary) = find_subslice(bytes, &marker, cursor) else {
+            break;
+        };
+        let part = trim_part_tail(&bytes[cursor..next_boundary]);
+        cursor = next_boundary;
+
+        let (headers, body) = if let Some(idx) = find_subslice(part, b"\r\n\r\n", 0) {
+            (&part[..idx], &part[idx + 4..])
+        } else if let Some(idx) = find_subslice(part, b"\n\n", 0) {
+            (&part[..idx], &part[idx + 2..])
+        } else {
+            continue;
+        };
+
+        let headers_text = String::from_utf8_lossy(headers);
+        let disposition = headers_text
+            .lines()
+            .find(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("content-disposition:")
+            })
+            .unwrap_or("");
+        let content_type = headers_text
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+            .and_then(|line| {
+                line.split_once(':')
+                    .map(|(_, value)| value.trim().to_string())
+            });
+        let Some(name) = extract_quoted_param(disposition, "name") else {
+            continue;
+        };
+        let filename = extract_quoted_param(disposition, "filename");
+
+        if filename.is_some() || content_type.as_deref().unwrap_or("").starts_with("image/") {
+            files.push(serde_json::json!({
+                "field": name,
+                "filename": filename,
+                "content_type": content_type,
+                "bytes": body.len()
+            }));
+        } else if let Ok(text) = std::str::from_utf8(body) {
+            let value = truncate_for_log(text.trim(), MAX_LOGGED_FIELD_CHARS);
+            if name == "model" {
+                model = Some(value.clone());
+            }
+            fields.insert(name, Value::String(value));
+        } else {
+            fields.insert(
+                name,
+                Value::String(format!("[binary field: {} bytes]", body.len())),
+            );
+        }
+    }
+
+    let summary = serde_json::json!({
+        "content_type": "multipart/form-data",
+        "path": uri,
+        "fields": fields,
+        "files": files,
+        "raw_bytes": bytes.len()
+    });
+    let rendered = serde_json::to_string_pretty(&summary).ok()?;
+    Some((rendered, model))
+}
+
+fn image_mime_and_dimensions(bytes: &[u8]) -> (String, Option<(u32, u32)>) {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return ("image/png".to_string(), Some((width, height)));
+    }
+
+    if bytes.starts_with(b"\xff\xd8") {
+        let mut idx = 2;
+        while idx + 9 < bytes.len() {
+            if bytes[idx] != 0xff {
+                idx += 1;
+                continue;
+            }
+            let marker = bytes[idx + 1];
+            if marker == 0xd9 || marker == 0xda {
+                break;
+            }
+            if idx + 4 > bytes.len() {
+                break;
+            }
+            let segment_len = u16::from_be_bytes([bytes[idx + 2], bytes[idx + 3]]) as usize;
+            if segment_len < 2 || idx + 2 + segment_len > bytes.len() {
+                break;
+            }
+            if matches!(
+                marker,
+                0xc0 | 0xc1
+                    | 0xc2
+                    | 0xc3
+                    | 0xc5
+                    | 0xc6
+                    | 0xc7
+                    | 0xc9
+                    | 0xca
+                    | 0xcb
+                    | 0xcd
+                    | 0xce
+                    | 0xcf
+            ) && segment_len >= 7
+            {
+                let height = u16::from_be_bytes([bytes[idx + 5], bytes[idx + 6]]) as u32;
+                let width = u16::from_be_bytes([bytes[idx + 7], bytes[idx + 8]]) as u32;
+                return ("image/jpeg".to_string(), Some((width, height)));
+            }
+            idx += 2 + segment_len;
+        }
+        return ("image/jpeg".to_string(), None);
+    }
+
+    ("application/octet-stream".to_string(), None)
+}
+
+fn summarize_image_json_response(json: &Value) -> Option<String> {
+    let mut summary = json.clone();
+    let data = summary.get_mut("data")?.as_array_mut()?;
+    for item in data.iter_mut() {
+        if let Some(obj) = item.as_object_mut() {
+            if let Some(b64) = obj.get("b64_json").and_then(|v| v.as_str()) {
+                let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok();
+                let (mime_type, dimensions, bytes) = decoded
+                    .as_deref()
+                    .map(|bytes| {
+                        let (mime, dims) = image_mime_and_dimensions(bytes);
+                        (mime, dims, bytes.len())
+                    })
+                    .unwrap_or_else(|| ("unknown".to_string(), None, b64.len() * 3 / 4));
+                obj.remove("b64_json");
+                obj.insert(
+                    "image".to_string(),
+                    serde_json::json!({
+                        "encoding": "base64",
+                        "redacted": true,
+                        "mime_type": mime_type,
+                        "bytes": bytes,
+                        "dimensions": dimensions.map(|(width, height)| serde_json::json!({
+                            "width": width,
+                            "height": height
+                        }))
+                    }),
+                );
+            } else if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+                if url.starts_with("data:image/") {
+                    obj.insert(
+                        "url".to_string(),
+                        Value::String(format!("[data URL redacted: {} chars]", url.len())),
+                    );
+                }
+            }
+        }
+    }
+    serde_json::to_string_pretty(&summary).ok()
+}
 
 /// Helper function to record User Token usage
 fn record_user_token_usage(
@@ -30,6 +262,83 @@ fn record_user_token_usage(
             log.status as u16,
             user_agent,
         );
+    }
+}
+
+fn extract_cached_tokens(usage: &Value) -> Option<u32> {
+    usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.get("total_cached_tokens"))
+        .or_else(|| usage.get("cachedContentTokenCount"))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+}
+
+fn value_as_u32(value: Option<&Value>) -> Option<u32> {
+    value.and_then(|v| v.as_u64()).map(|v| v as u32)
+}
+
+fn extract_input_tokens(usage: &Value) -> Option<u32> {
+    value_as_u32(
+        usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .or_else(|| usage.get("total_input_tokens"))
+            .or_else(|| usage.get("promptTokenCount")),
+    )
+}
+
+fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
+    value_as_u32(
+        usage
+            .get("reasoning_tokens")
+            .or_else(|| {
+                usage
+                    .get("output_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens"))
+            })
+            .or_else(|| {
+                usage
+                    .get("completion_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens"))
+            })
+            .or_else(|| usage.get("total_thought_tokens"))
+            .or_else(|| usage.get("totalThoughtTokens"))
+            .or_else(|| usage.get("thoughtsTokenCount")),
+    )
+}
+
+fn extract_output_tokens(usage: &Value) -> Option<u32> {
+    if let Some(tokens) = value_as_u32(
+        usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens")),
+    ) {
+        return Some(tokens);
+    }
+
+    let base = value_as_u32(
+        usage
+            .get("total_output_tokens")
+            .or_else(|| usage.get("candidatesTokenCount")),
+    )?;
+    let has_new_format = usage.get("total_output_tokens").is_some();
+    if has_new_format {
+        let reasoning = extract_reasoning_tokens(usage).unwrap_or(0);
+        let tool_use = value_as_u32(usage.get("total_tool_use_tokens")).unwrap_or(0);
+        Some(base + reasoning + tool_use)
+    } else {
+        Some(base)
     }
 }
 
@@ -71,6 +380,13 @@ pub async fn monitor_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let request_content_type = request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     let mut model = if uri.contains("/v1beta/models/") {
         uri.split("/v1beta/models/")
             .nth(1)
@@ -90,14 +406,28 @@ pub async fn monitor_middleware(
         let (parts, body) = request.into_parts();
         match axum::body::to_bytes(body, MAX_REQUEST_LOG_SIZE).await {
             Ok(bytes) => {
-                if model.is_none() {
-                    model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
-                        v.get("model")
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string())
-                    });
-                }
-                request_body_str = if let Ok(s) = std::str::from_utf8(&bytes) {
+                request_body_str = if request_content_type.starts_with("multipart/form-data") {
+                    if let Some((summary, multipart_model)) =
+                        summarize_multipart_request(&bytes, &request_content_type, &uri)
+                    {
+                        if model.is_none() {
+                            model = multipart_model;
+                        }
+                        Some(summary)
+                    } else {
+                        Some(format!(
+                            "[Multipart Request Data: {} bytes, failed to parse summary]",
+                            bytes.len()
+                        ))
+                    }
+                } else if let Ok(s) = std::str::from_utf8(&bytes) {
+                    if model.is_none() {
+                        model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
+                            v.get("model")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string())
+                        });
+                    }
                     Some(s.to_string())
                 } else {
                     Some("[Binary Request Data]".to_string())
@@ -159,6 +489,7 @@ pub async fn monitor_middleware(
     let username = user_token_identity
         .as_ref()
         .map(|identity| identity.username.clone());
+    let is_image_route = uri.contains("/v1/images/");
 
     let monitor = state.monitor.clone();
     let mut log = ProxyRequestLog {
@@ -177,6 +508,7 @@ pub async fn monitor_middleware(
         response_body: None,
         input_tokens: None,
         output_tokens: None,
+        cached_tokens: None,
         protocol,
         username,
     };
@@ -214,6 +546,8 @@ pub async fn monitor_middleware(
                 let mut response_content = String::new();
                 let mut thinking_signature = String::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
+                let mut cached_tokens: Option<u32> = None;
+                let mut reasoning_tokens: Option<u32> = None;
 
                 for line in full_response.lines() {
                     if !line.starts_with("data: ") {
@@ -367,6 +701,45 @@ pub async fn monitor_middleware(
                                     }
                                 }
                             }
+                            Some("response.output_text.delta") => {
+                                if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
+                                    response_content.push_str(text);
+                                }
+                            }
+                            Some("response.reasoning_summary_text.delta") => {
+                                if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
+                                    thinking_content.push_str(text);
+                                }
+                            }
+                            Some("response.output_item.added") => {
+                                if let Some(item) = json.get("item") {
+                                    if item.get("type").and_then(|t| t.as_str())
+                                        == Some("function_call")
+                                    {
+                                        let name =
+                                            item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let id = item
+                                            .get("call_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        tool_calls.push(serde_json::json!({
+                                            "id": id,
+                                            "type": "function",
+                                            "function": { "name": name, "arguments": "" }
+                                        }));
+                                    }
+                                }
+                            }
+                            Some("response.function_call_arguments.delta") => {
+                                if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
+                                    if let Some(last_tc) = tool_calls.last_mut() {
+                                        let old_args =
+                                            last_tc["function"]["arguments"].as_str().unwrap_or("");
+                                        last_tc["function"]["arguments"] =
+                                            Value::String(format!("{}{}", old_args, delta));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
 
@@ -395,19 +768,14 @@ pub async fn monitor_middleware(
                             .get("usage")
                             .or(json.get("usageMetadata"))
                             .or(json.get("response").and_then(|r| r.get("usage")))
+                            .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = usage
-                                .get("prompt_tokens")
-                                .or(usage.get("input_tokens"))
-                                .or(usage.get("promptTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                            log.output_tokens = usage
-                                .get("completion_tokens")
-                                .or(usage.get("output_tokens"))
-                                .or(usage.get("candidatesTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
+                            log.input_tokens = extract_input_tokens(usage);
+                            log.output_tokens = extract_output_tokens(usage);
+                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
+                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
+                            reasoning_tokens =
+                                reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -422,6 +790,9 @@ pub async fn monitor_middleware(
 
                 // Build consolidated response object
                 let mut consolidated = serde_json::Map::new();
+                let has_actual_content = !response_content.is_empty()
+                    || !tool_calls.is_empty()
+                    || !thinking_content.is_empty();
 
                 if !thinking_content.is_empty() {
                     consolidated.insert("thinking".to_string(), Value::String(thinking_content));
@@ -444,11 +815,65 @@ pub async fn monitor_middleware(
                             .insert("tool_calls".to_string(), Value::Array(clean_tool_calls));
                     }
                 }
-                if let Some(input) = log.input_tokens {
-                    consolidated.insert("input_tokens".to_string(), Value::Number(input.into()));
-                }
-                if let Some(output) = log.output_tokens {
-                    consolidated.insert("output_tokens".to_string(), Value::Number(output.into()));
+                if has_actual_content {
+                    let mut usage_obj = serde_json::Map::new();
+                    let input_toks = log.input_tokens.unwrap_or(0);
+                    let output_toks = log.output_tokens.unwrap_or(0);
+                    let cached_toks = cached_tokens.unwrap_or(0);
+                    let reasoning_toks = reasoning_tokens.unwrap_or(0);
+                    let is_responses_api =
+                        log.url.contains("/responses") || log.url.contains("/interactions");
+
+                    if is_responses_api {
+                        usage_obj
+                            .insert("input_tokens".to_string(), Value::Number(input_toks.into()));
+                        usage_obj.insert(
+                            "input_tokens_details".to_string(),
+                            serde_json::json!({ "cached_tokens": cached_toks }),
+                        );
+                        usage_obj.insert(
+                            "output_tokens".to_string(),
+                            Value::Number(output_toks.into()),
+                        );
+                        usage_obj.insert(
+                            "output_tokens_details".to_string(),
+                            serde_json::json!({ "reasoning_tokens": reasoning_toks }),
+                        );
+                        usage_obj.insert(
+                            "total_tokens".to_string(),
+                            Value::Number((input_toks + output_toks).into()),
+                        );
+                    } else {
+                        usage_obj.insert(
+                            "prompt_tokens".to_string(),
+                            Value::Number(input_toks.into()),
+                        );
+                        usage_obj.insert(
+                            "completion_tokens".to_string(),
+                            Value::Number(output_toks.into()),
+                        );
+                        usage_obj.insert(
+                            "total_tokens".to_string(),
+                            Value::Number((input_toks + output_toks).into()),
+                        );
+                        if cached_tokens.is_some() {
+                            usage_obj.insert(
+                                "cache_read_input_tokens".to_string(),
+                                Value::Number(cached_toks.into()),
+                            );
+                            usage_obj.insert(
+                                "prompt_tokens_details".to_string(),
+                                serde_json::json!({ "cached_tokens": cached_toks }),
+                            );
+                        }
+                        if reasoning_tokens.is_some() {
+                            usage_obj.insert(
+                                "completion_tokens_details".to_string(),
+                                serde_json::json!({ "reasoning_tokens": reasoning_toks }),
+                            );
+                        }
+                    }
+                    consolidated.insert("usage".to_string(), Value::Object(usage_obj));
                 }
 
                 if consolidated.is_empty() {
@@ -480,19 +905,12 @@ pub async fn monitor_middleware(
                                     .get("usage")
                                     .or(json.get("usageMetadata"))
                                     .or(json.get("response").and_then(|r| r.get("usage")))
+                                    .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                                 {
-                                    log.input_tokens = usage
-                                        .get("prompt_tokens")
-                                        .or(usage.get("input_tokens"))
-                                        .or(usage.get("promptTokenCount"))
-                                        .and_then(|v| v.as_u64())
-                                        .map(|v| v as u32);
-                                    log.output_tokens = usage
-                                        .get("completion_tokens")
-                                        .or(usage.get("output_tokens"))
-                                        .or(usage.get("candidatesTokenCount"))
-                                        .and_then(|v| v.as_u64())
-                                        .map(|v| v as u32);
+                                    log.input_tokens = extract_input_tokens(usage);
+                                    log.output_tokens = extract_output_tokens(usage);
+                                    log.cached_tokens =
+                                        log.cached_tokens.or_else(|| extract_cached_tokens(usage));
                                     break;
                                 }
                             }
@@ -522,19 +940,16 @@ pub async fn monitor_middleware(
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
-                        if let Some(usage) = json.get("usage").or(json.get("usageMetadata")) {
-                            log.input_tokens = usage
-                                .get("prompt_tokens")
-                                .or(usage.get("input_tokens"))
-                                .or(usage.get("promptTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                            log.output_tokens = usage
-                                .get("completion_tokens")
-                                .or(usage.get("output_tokens"))
-                                .or(usage.get("candidatesTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
+                        if let Some(usage) = json
+                            .get("usage")
+                            .or(json.get("usageMetadata"))
+                            .or(json.get("response").and_then(|r| r.get("usage")))
+                            .or(json.get("response").and_then(|r| r.get("usageMetadata")))
+                        {
+                            log.input_tokens = extract_input_tokens(usage);
+                            log.output_tokens = extract_output_tokens(usage);
+                            log.cached_tokens =
+                                log.cached_tokens.or_else(|| extract_cached_tokens(usage));
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -545,7 +960,14 @@ pub async fn monitor_middleware(
                             }
                         }
                     }
-                    log.response_body = Some(s.to_string());
+                    if is_image_route {
+                        log.response_body = serde_json::from_str::<Value>(&s)
+                            .ok()
+                            .and_then(|json| summarize_image_json_response(&json))
+                            .or_else(|| Some(s.to_string()));
+                    } else {
+                        log.response_body = Some(s.to_string());
+                    }
                 } else {
                     log.response_body = Some("[Binary Response Data]".to_string());
                 }

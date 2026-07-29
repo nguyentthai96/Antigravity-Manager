@@ -961,12 +961,12 @@ export default function ApiProxy() {
             return `from anthropic import Anthropic
 
 client = Anthropic(
-    # 推荐使用 127.0.0.1
+    # Recommended: use 127.0.0.1
     base_url="${`http://127.0.0.1:${port}`}",
     api_key="${apiKey}"
 )
 
-# 注意: Antigravity 支持使用 Anthropic SDK 调用任意模型
+# Note: Antigravity lets you call any model via the Anthropic SDK
 response = client.messages.create(
     model="${modelId}",
     max_tokens=1024,
@@ -979,10 +979,10 @@ print(response.content[0].text)`;
         // 2. Gemini Protocol (Native)
         if (selectedProtocol === 'gemini') {
             const rawBaseUrl = `http://127.0.0.1:${port}`;
-            return `# 需要安装: pip install google-generativeai
+            return `# Requires: pip install google-generativeai
 import google.generativeai as genai
 
-# 使用 Antigravity 代理地址 (推荐 127.0.0.1)
+# Use the Antigravity proxy address (recommended: 127.0.0.1)
 genai.configure(
     api_key="${apiKey}",
     transport='rest',
@@ -994,8 +994,8 @@ response = model.generate_content("Hello")
 print(response.text)`;
         }
 
-        // 3. OpenAI Protocol
-        if (modelId.startsWith('gemini-3-pro-image')) {
+        // 3. OpenAI Protocol — image generation models (any *-image model)
+        if (modelId.toLowerCase().includes('-image')) {
             return `from openai import OpenAI
 
 client = OpenAI(
@@ -1003,21 +1003,33 @@ client = OpenAI(
     api_key="${apiKey}"
 )
 
+# IMPORTANT — model availability:
+#   "${modelId}" must be an image model your selected account actually has.
+#   Check the model list on the left: not every account exposes every image model
+#   (e.g. some accounts only have gemini-3.1-flash-image, not gemini-3-pro-image).
+#   Requesting a model the account lacks fails with:
+#     404 "Requested entity was not found"
+#   To keep using a different name, add an explicit mapping in the Model Routing Center.
+
 response = client.chat.completions.create(
     model="${modelId}",
-    # 方式 1: 使用 size 参数 (推荐)
-    # 支持: "1024x1024" (1:1), "1280x720" (16:9), "720x1280" (9:16), "1216x896" (4:3)
+
+    # Aspect ratio — Option 1: the size parameter (recommended)
+    #   "1024x1024" = 1:1   |   "1280x720" = 16:9
+    #   "720x1280"  = 9:16  |   "1216x896" = 4:3
     extra_body={ "size": "1024x1024" },
-    
-    # 方式 2: 使用模型后缀
-    # 例如: gemini-3-pro-image-16-9, gemini-3-pro-image-4-3
-    # model="gemini-3-pro-image-16-9",
+
+    # Aspect ratio — Option 2: a model-name suffix instead of size
+    #   model="${modelId}-16-9"   (also: -9-16, -4-3, -3-4)
     messages=[{
         "role": "user",
         "content": "Draw a futuristic city"
     }]
 )
 
+# The generated image is returned INSIDE the message content
+# (as a base64 data URL / markdown image), not as a hosted URL.
+# Extract the base64 payload from here to save the file.
 print(response.choices[0].message.content)`;
         }
 
@@ -1936,87 +1948,98 @@ print(response.choices[0].message.content)`;
                                         <div className="space-y-1">
                                             <div className="flex items-center gap-2">
                                                 <span className="text-sm font-bold text-gray-900 dark:text-base-content">
-                                                    {t('proxy.config.experimental.enable_usage_scaling')}
+                                                    {t('proxy.config.experimental.compression_level_label', { defaultValue: '智能上下文压缩等级' })}
                                                 </span>
-                                                <HelpTooltip text={t('proxy.config.experimental.enable_usage_scaling_tooltip')} />
-                                                <span className="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-[10px] text-purple-600 dark:text-purple-400 font-bold border border-purple-200 dark:border-purple-800">
-                                                    Claude
+                                                <HelpTooltip text={t('proxy.config.experimental.compression_level_tooltip', { defaultValue: '选择您希望启用的压缩等级。静态降噪与口语提纯不需要达到 30k 即可常驻生效。' })} />
+                                                <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/30 text-[10px] text-indigo-600 dark:text-indigo-400 font-bold border border-indigo-200 dark:border-indigo-800">
+                                                    All Protocols
                                                 </span>
                                             </div>
                                             <p className="text-[10px] text-gray-500 dark:text-gray-400 max-w-lg">
-                                                {t('proxy.config.experimental.enable_usage_scaling_tooltip')}
+                                                {t('proxy.config.experimental.compression_level_desc', { defaultValue: '选择不同的压缩方案：Low 仅终端日志降噪；Medium 在此基础上增加口语净化；High 额外开启大上下文分阶段防御重置。' })}
                                             </p>
                                         </div>
-                                        <label className="relative inline-flex items-center cursor-pointer">
-                                            <input
-                                                type="checkbox"
-                                                className="sr-only peer"
-                                                checked={!!appConfig.proxy.experimental?.enable_usage_scaling}
-                                                onChange={(e) => updateExperimentalConfig({ enable_usage_scaling: e.target.checked })}
-                                            />
-                                            <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-purple-500 shadow-inner"></div>
-                                        </label>
+                                        <select
+                                            className="select select-sm select-bordered w-48 text-xs font-normal focus:outline-none dark:bg-base-300 dark:text-base-content border-gray-200 dark:border-base-400"
+                                            value={appConfig.proxy.experimental?.compression_level || (appConfig.proxy.experimental?.enable_usage_scaling ? 'high' : 'disabled')}
+                                            onChange={(e) => {
+                                                const val = e.target.value;
+                                                updateExperimentalConfig({
+                                                    compression_level: val,
+                                                    enable_usage_scaling: val === 'high'
+                                                });
+                                            }}
+                                        >
+                                            <option value="disabled" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_disabled', { defaultValue: '关闭 (Disabled)' })}</option>
+                                            <option value="low" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_low', { defaultValue: '低度 (Low - 日志降噪)' })}</option>
+                                            <option value="medium" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_medium', { defaultValue: '中度 (Medium - 日志+口语)' })}</option>
+                                            <option value="high" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_high', { defaultValue: '高度 (High - 动态防暴)' })}</option>
+                                        </select>
                                     </div>
 
-                                    {/* L1 Threshold */}
-                                    <div className="flex flex-col gap-2 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
-                                        <div className="flex items-center justify-between w-full">
-                                            <div className="flex items-center gap-2">
-                                                <span className="text-sm font-bold text-gray-900 dark:text-base-content">
-                                                    {t('proxy.config.experimental.context_compression_threshold_l1')}
-                                                </span>
-                                                <HelpTooltip text={t('proxy.config.experimental.context_compression_threshold_l1_tooltip')} />
+                                    {((appConfig.proxy.experimental?.compression_level || (appConfig.proxy.experimental?.enable_usage_scaling ? 'high' : 'disabled')) === 'high') && (
+                                        <>
+                                            {/* L1 Threshold */}
+                                            <div className="flex flex-col gap-2 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
+                                                <div className="flex items-center justify-between w-full">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-sm font-bold text-gray-900 dark:text-base-content">
+                                                            {t('proxy.config.experimental.context_compression_threshold_l1')}
+                                                        </span>
+                                                        <HelpTooltip text={t('proxy.config.experimental.context_compression_threshold_l1_tooltip')} />
+                                                    </div>
+                                                </div>
+                                                <DebouncedSlider
+                                                    min={0.1}
+                                                    max={1}
+                                                    step={0.05}
+                                                    className="range range-purple range-xs"
+                                                    value={appConfig.proxy.experimental?.context_compression_threshold_l1 || 0.4}
+                                                    onChange={(val) => updateExperimentalConfig({ context_compression_threshold_l1: val })}
+                                                />
                                             </div>
-                                        </div>
-                                        <DebouncedSlider
-                                            min={0.1}
-                                            max={1}
-                                            step={0.05}
-                                            className="range range-purple range-xs"
-                                            value={appConfig.proxy.experimental?.context_compression_threshold_l1 || 0.4}
-                                            onChange={(val) => updateExperimentalConfig({ context_compression_threshold_l1: val })}
-                                        />
-                                    </div>
 
-                                    {/* L2 Threshold */}
-                                    <div className="flex flex-col gap-2 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
-                                        <div className="flex items-center justify-between w-full">
-                                            <div className="flex items-center gap-2">
-                                                <span className="text-sm font-bold text-gray-900 dark:text-base-content">
-                                                    {t('proxy.config.experimental.context_compression_threshold_l2')}
-                                                </span>
-                                                <HelpTooltip text={t('proxy.config.experimental.context_compression_threshold_l2_tooltip')} />
+                                            {/* L2 Threshold */}
+                                            <div className="flex flex-col gap-2 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
+                                                <div className="flex items-center justify-between w-full">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-sm font-bold text-gray-900 dark:text-base-content">
+                                                            {t('proxy.config.experimental.context_compression_threshold_l2')}
+                                                        </span>
+                                                        <HelpTooltip text={t('proxy.config.experimental.context_compression_threshold_l2_tooltip')} />
+                                                    </div>
+                                                </div>
+                                                <DebouncedSlider
+                                                    min={0.1}
+                                                    max={1}
+                                                    step={0.05}
+                                                    className="range range-purple range-xs"
+                                                    value={appConfig.proxy.experimental?.context_compression_threshold_l2 || 0.55}
+                                                    onChange={(val) => updateExperimentalConfig({ context_compression_threshold_l2: val })}
+                                                />
                                             </div>
-                                        </div>
-                                        <DebouncedSlider
-                                            min={0.1}
-                                            max={1}
-                                            step={0.05}
-                                            className="range range-purple range-xs"
-                                            value={appConfig.proxy.experimental?.context_compression_threshold_l2 || 0.55}
-                                            onChange={(val) => updateExperimentalConfig({ context_compression_threshold_l2: val })}
-                                        />
-                                    </div>
 
-                                    {/* L3 Threshold */}
-                                    <div className="flex flex-col gap-2 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
-                                        <div className="flex items-center justify-between w-full">
-                                            <div className="flex items-center gap-2">
-                                                <span className="text-sm font-bold text-gray-900 dark:text-base-content">
-                                                    {t('proxy.config.experimental.context_compression_threshold_l3')}
-                                                </span>
-                                                <HelpTooltip text={t('proxy.config.experimental.context_compression_threshold_l3_tooltip')} />
+                                            {/* L3 Threshold */}
+                                            <div className="flex flex-col gap-2 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
+                                                <div className="flex items-center justify-between w-full">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-sm font-bold text-gray-900 dark:text-base-content">
+                                                            {t('proxy.config.experimental.context_compression_threshold_l3')}
+                                                        </span>
+                                                        <HelpTooltip text={t('proxy.config.experimental.context_compression_threshold_l3_tooltip')} />
+                                                    </div>
+                                                </div>
+                                                <DebouncedSlider
+                                                    min={0.1}
+                                                    max={1}
+                                                    step={0.05}
+                                                    className="range range-purple range-xs"
+                                                    value={appConfig.proxy.experimental?.context_compression_threshold_l3 || 0.7}
+                                                    onChange={(val) => updateExperimentalConfig({ context_compression_threshold_l3: val })}
+                                                />
                                             </div>
-                                        </div>
-                                        <DebouncedSlider
-                                            min={0.1}
-                                            max={1}
-                                            step={0.05}
-                                            className="range range-purple range-xs"
-                                            value={appConfig.proxy.experimental?.context_compression_threshold_l3 || 0.7}
-                                            onChange={(val) => updateExperimentalConfig({ context_compression_threshold_l3: val })}
-                                        />
-                                    </div>
+                                        </>
+                                    )}
                                 </div>
                             </CollapsibleCard>
 

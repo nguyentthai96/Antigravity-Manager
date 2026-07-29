@@ -1,15 +1,15 @@
 # Antigravity Tools 🚀
-> Professional AI Account Management & Protocol Proxy System (v4.2.3)
+> Professional AI Account Management & Protocol Proxy System (v4.4.9)
 
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
 
-  <h3>Your Personal High-Performance AI Dispatch Gateway</h3>
-  <p>Seamlessly proxy Gemini & Claude. OpenAI-Compatible. Privacy First.</p>
+  <h3>Your Personal High-Performance AI Gateway</h3>
+  <p>More than account management—the ultimate solution to breaking down API call barriers.</p>
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.2.3-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.4.9-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -42,10 +42,11 @@ By leveraging this app, you can transform common Web Sessions (Google/Anthropic)
 | Sponsor | Description |
 | :---: | :--- |
 | <img src="docs/images/packycode_logo.png" width="200" alt="PackyCode Logo"> | Thanks to **PackyCode** for sponsoring this project! PackyCode is a reliable and efficient API relay service provider, offering relays for various services such as Claude Code, Codex, and Gemini. PackyCode provides a special offer for users of this project: Register using [this link](https://www.packyapi.com/register?aff=Ctrler) and enter the **"Ctrler"** coupon code when topping up to enjoy a **10% discount**. |
+| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | Thanks to **APIKEY.FUN** for sponsoring this project! APIKEY.FUN is a professional enterprise-grade AI relay station, dedicated to providing stable, efficient, and low-cost AI model API access services for enterprise and individual developers. The platform supports mainstream popular models such as Claude, OpenAI, and Gemini, with prices as low as 7% of the official original price. Register through [this exclusive link](https://apikey.fun/register?aff=Ctrler) for this project to enjoy an exclusive offer of up to **permanent 5% off on top-ups**. |
 | <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | Thanks to **Claude API** for supporting this project! claudeapi.com is a **Claude API** relay station built on **official and AWS channels**, focused exclusively on Claude, delivering high stability and low latency with full support for Claude Code. Exclusive offer: register via this [exclusive link](https://console.claudeapi.com/register?source=antigravity) to get **free trial credits — zero setup, get started instantly**; enjoy an extra **5% off** when you top up（Contact Support). |
 | <img src="docs/images/AICodeMirror.jpg" width="200" alt="AICodeMirror Logo"> | Thanks to **AICodeMirror** for sponsoring this project! AICodeMirror provides official high-stability relay services for Claude Code / Codex / Gemini CLI, supporting enterprise-grade concurrency, fast invoicing, and 24/7 dedicated technical support. Claude Code / Codex / Gemini official channels at 38% / 2% / 9% of original price, with extra discounts on top-ups! AICodeMirror offers special benefits for Antigravity-Manager users: register via [this link](https://www.aicodemirror.com/register?invitecode=MV5XUM) to enjoy 20% off your first top-up, and enterprise customers can get up to 25% off! |
-| <img src="https://coder.visioncoder.cn/logo.png" width="200" alt="VisionCoder Logo"> | Thanks to **VisionCoder** for supporting this project. [VisionCoder Developer Platform](https://coder.visioncoder.cn) is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity. Additionally, **VisionCoder** now offers retail channels for **Claude Max 200** and **GPT Pro 200** **premium** accounts, providing users with instant access to top-tier AI computing power and features. |
-| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | Thanks to **APIKEY.FUN** for sponsoring this project! APIKEY.FUN is a professional enterprise-grade AI relay station, dedicated to providing stable, efficient, and low-cost AI model API access services for enterprise and individual developers. The platform supports mainstream popular models such as Claude, OpenAI, and Gemini, with prices as low as 7% of the official original price. Register through [this exclusive link](https://apikey.fun/register?aff=Ctrler) for this project to enjoy an exclusive offer of up to **permanent 5% off on top-ups**. |
+
+
 
 
 
@@ -133,7 +134,7 @@ Automatically detects your OS, architecture, and package manager — one command
 
 **Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/v4.2.3/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/v4.4.9/install.sh | bash
 ```
 
 **Windows (PowerShell):**
@@ -143,7 +144,7 @@ irm https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/install.ps
 
 > **Supported formats**: Linux (`.deb` / `.rpm` / `.AppImage`) | macOS (`.dmg`) | Windows (NSIS `.exe`)
 >
-> **Advanced usage**: Install a specific version `curl -fsSL ... | bash -s -- --version 4.2.3`，dry-run mode `curl -fsSL ... | bash -s -- --dry-run`
+> **Advanced usage**: Install a specific version `curl -fsSL ... | bash -s -- --version 4.4.9`，dry-run mode `curl -fsSL ... | bash -s -- --dry-run`
 
 #### macOS - Homebrew
 If you have [Homebrew](https://brew.sh/) installed, you can also install via:
@@ -290,9 +291,348 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### How to use with Kilo Code?
+1.  **Protocol Selection**: We recommend using the **Gemini protocol**.
+2.  **Base URL**: Set it to `http://127.0.0.1:8045`.
+3.  **Note**: 
+    - **OpenAI Protocol Limitation**: When using OpenAI mode, Kilo Code's request path will append `/v1/chat/completions/responses`, a non-standard path that will return 404 from Antigravity. Make sure to enter the Base URL and select Gemini mode.
+    - **Model Mapping**: Model names in Kilo Code may differ from Antigravity's defaults. If you encounter connection issues, set up custom mappings on the "Model Mapping" page and check the **log files** for debugging.
+
+### How to use Image Generation (Imagen 3)?
+
+#### Method 1: OpenAI Images API (Recommended)
+```python
+import openai
+
+client = openai.OpenAI(
+    api_key="***",
+    base_url="http://127.0.0.1:8045/v1"
+)
+
+# Generate image
+response = client.images.generate(
+    model="gemini-3-pro-image",
+    prompt="A futuristic cyberpunk city with neon lights",
+    size="1920x1080",      # Supports any WIDTHxHEIGHT format, auto-calculates aspect ratio
+    quality="hd",          # "standard" | "hd" | "medium"
+    n=1,
+    response_format="b64_json"
+)
+
+# Save image
+import base64
+image_data = base64.b64decode(response.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_data)
+```
+
+**Supported parameters**：
+- **`size`**: Any `WIDTHxHEIGHT` format (e.g. `1280x720`, `1024x1024`, `1920x1080`), auto-calculates and maps to standard aspect ratios (21:9, 16:9, 9:16, 4:3, 3:4, 1:1)
+- **`quality`**: 
+  - `"hd"` → 4K resolution (high quality)
+  - `"medium"` → 2K resolution (medium quality)
+  - `"standard"` → Default resolution (standard quality)
+- **`n`**: Number of images to generate (1-10)
+- **`response_format`**: `"b64_json"` or `"url"` (Data URI)
+
+#### Method 2: Chat API + Parameters (✨ New)
+
+**All protocols** (OpenAI, Claude) Chat APIs now support direct `size` and `quality` parameters:
+
+```python
+# OpenAI Chat API
+response = client.chat.completions.create(
+    model="gemini-3-pro-image",
+    size="1920x1080",      # ✅ Supports any WIDTHxHEIGHT format
+    quality="hd",          # ✅ "standard" | "hd" | "medium"
+    messages=[{"role": "user", "content": "A futuristic city"}]
+)
+```
+
+```bash
+# Claude Messages API
+curl -X POST http://127.0.0.1:8045/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: ***" \
+  -d '{
+    "model": "gemini-3-pro-image",
+    "size": "1280x720",
+    "quality": "hd",
+    "messages": [{"role": "user", "content": "A cute cat"}]
+  }'
+```
+
+**Parameter priority**: `imageSize` parameter > `quality` parameter > model suffix
+
+**✨ New `imageSize` parameter support**:
+
+In addition to the `quality` parameter, you can now also use Gemini's native `imageSize` parameter:
+
+```python
+# Using imageSize parameter (highest priority)
+response = client.chat.completions.create(
+    model="gemini-3-pro-image",
+    size="16:9",           # Aspect ratio
+    imageSize="4K",        # ✨ Direct resolution: "1K" | "2K" | "4K"
+    messages=[{"role": "user", "content": "A futuristic city"}]
+)
+```
+
+```bash
+# Claude Messages API also supports imageSize
+curl -X POST http://127.0.0.1:8045/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: ***" \
+  -d '{
+    "model": "gemini-3-pro-image",
+    "size": "1280x720",
+    "imageSize": "4K",
+    "messages": [{"role": "user", "content": "A cute cat"}]
+  }'
+```
+
+**Parameter descriptions**:
+- **`imageSize`**: Direct resolution specification (`"1K"` / `"2K"` / `"4K"`)
+- **`quality`**: Infers resolution from quality level (`"standard"` → 1K, `"medium"` → 2K, `"hd"` → 4K)
+- **Priority**: If both `imageSize` and `quality` are specified, the system prioritizes `imageSize`
+
+#### Method 3: Chat API + Model Suffix
+```python
+response = client.chat.completions.create(
+    model="gemini-3-pro-image-16-9-4k",  # Format: gemini-3-pro-image-[ratio]-[quality]
+    messages=[{"role": "user", "content": "A futuristic city"}]
+)
+```
+
+**Model suffix explanation**：
+- **Aspect ratio**: `-16-9`, `-9-16`, `-4-3`, `-3-4`, `-21-9`, `-1-1`
+- **Quality**: `-4k` (4K), `-2k` (2K), no suffix (standard)
+- **Example**: `gemini-3-pro-image-16-9-4k` → 16:9 ratio + 4K resolution
+
+#### Method 4: Cherry Studio & Other Client Settings
+In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure image generation parameters via the **Model Settings** page:
+
+1. **Enter Model Settings**: Select the `gemini-3-pro-image` model
+2. **Configure Parameters**:
+   - **Size**: Enter any `WIDTHxHEIGHT` format (e.g. `1920x1080`, `1024x1024`)
+   - **Quality**: Choose `standard` / `hd` / `medium`
+   - **Number**: Set the number of images (1-10)
+3. **Send Request**: Simply type your image description in the chat dialog
+
+**Parameter mapping rules**：
+- `size: "1920x1080"` → Auto-calculated as `16:9` aspect ratio
+- `quality: "hd"` → Mapped to `4K` resolution
+- `quality: "medium"` → Mapped to `2K` resolution
+
 ## 📝 Developer & Community
 
-*   **Changelog**:
+*   **Version History (Changelog)**:
+    *   **v4.4.9 (2026-07-28)**:
+        -   **[Core Feature] Multi-Source Account Auto-Discovery & Batch Import**:
+            -   **System Keyring/Keychain Extraction**: Supported automatic reading and decrypting credentials stored in macOS Keychain (`security`), Windows Credential Manager (`CredReadW`), and Linux Secret Service (`secret-tool`), compatible with latest Antigravity IDE (2.0+) and CLI tool `agy`.
+            -   **Multi-Path Candidate Database Search**: Automatically searched and resolved candidate SQLite databases (`state.vscdb`) across standard, portable, and custom paths for both standalone Antigravity IDE and VS Code / Cursor extensions.
+            -   **One-Click Full Multi-Source Batch Import**: Concurrent multi-source scanning across Keyring, IDE, extension databases, and CLI directories (`~/.antigravity-agent/`) with automatic token deduplication and batch importing of all unique local accounts.
+            -   *Related Issue*: See [Issue #3269](https://github.com/lbjlaq/Antigravity-Manager/issues/3269).
+    *   **v4.4.8 (2026-07-27)**:
+        -   **[Bug Fix] Fix Never Expire Token Validation**:
+            -   When User Token's `expires_type` is set to `"never"` and `expires_at` is `0`, it is no longer incorrectly flagged as expired (`403 Forbidden`).
+            -   Resolved duplicate test module name conflict in `claude.rs`.
+            -   *Related PR*: See [PR #3266](https://github.com/lbjlaq/Antigravity-Manager/pull/3266).
+        -   **[Bug Fix] Clear Stale Live Limit Locks on Quota Recovery**:
+            -   When account quota recovers (`percentage > 0%`), automatically clear the `RateLimitTracker` lock in memory and remove stale `live_limited_models` flags from local account JSON files to prevent false UI limit locks.
+            -   *Related PR*: See [PR #3267](https://github.com/lbjlaq/Antigravity-Manager/pull/3267).
+    *   **v4.4.7 (2026-07-19)**:
+        -   **[Bug Fix] Fix Linux Auto-Update & Process Close Issues**:
+            -   **Family Process Tree Correction**: Fixed family process tree traversal to prevent children (like the IDE) from being excluded from the close list, allowing it to be terminated properly.
+            -   **Keyring Write Timeout**: Added a thread-based 10s timeout protection for `secret-tool` commands on Linux to prevent account switching from locking up under Wayland when D-Bus is unreachable.
+            -   **Non-AppImage Update Gateway**: Added AppImage environment verification. Non-AppImage (e.g. RPM/DEB) package users will now be blocked from native auto-replacement (avoiding `ENOEXEC` issues) and guided to the GitHub release page to update manually.
+            -   *Related Issue*: See [Issue #3260](https://github.com/lbjlaq/Antigravity-Manager/issues/3260).
+    *   **v4.4.6 (2026-07-17)**:
+        -   **[Core Feature] Variant Mapping and OpenCode Configuration Sync**:
+            -   **Dynamic Model Routing**: Introduced a variant mapping mechanism for `canonical` models. It now dynamically maps to upstream target model IDs (like `gemini-3-flash-agent`) based on the client's intelligent tier selection (low/medium/high) while precisely injecting calibrated `thinkingBudget` and `maxOutputTokens` parameters.
+            -   **Comprehensive Protocol Support**: The variant resolution system is fully injected into Claude and OpenAI adapters, flawlessly supporting the Anthropic `effort` routing for new Gemini 3 variants.
+            -   *Related PR*: See [PR #3255](https://github.com/lbjlaq/Antigravity-Manager/pull/3255).
+        -   **[Frontend Optimization] Quota Dashboard Refactoring & New Model Support**:
+            -   **Unified Logic & Dynamic Fallback**: Completely overhauled the quota lookup logic across various dashboards, account tables, and cards (extracted into unified functions like `resolveQuotaModels`), eliminating hardcoded references. Introduced a display name fallback mechanism to prioritize remote API names.
+            -   **Full Gemini 3 Series Support**: Dashboards and quota filters now natively support displaying and protecting usage metrics for `gemini-3.5-flash` and `gemini-3.1-pro`.
+            -   *Related PR*: See [PR #3256](https://github.com/lbjlaq/Antigravity-Manager/pull/3256).
+    *   **v4.4.5 (2026-07-16)**:
+        -   **[Bug Fix] Fix Incorrect IDE Launch on "Classic" Button Click (Fix Classic Mode Downgrade Bug)**:
+            -   **Eliminate IDE Fallback**: Removed the aggressive fallback logic that launched Antigravity IDE when the Classic version (`target_ide` is `None`) path was not configured or found.
+            -   **Restrict Standard Directory Search**: Updated standard directory search paths to only search for `"Antigravity"` instead of falling back to `"Antigravity IDE"` when searching for the Classic executable, preventing unexpected IDE launches.
+            -   *Related Issue*: See [Issue #3253](https://github.com/lbjlaq/Antigravity-Manager/issues/3253).
+    *   **v4.4.4 (2026-07-15)**:
+        -   **[Core Feature] Standalone CLI Configuration & Extended OS Support**:
+            -   **Independent CLI Path Settings**: Added a dedicated configuration field for the underlying `agy` command-line tool in the settings panel to prevent path conflicts with the main application. Includes auto-detection via PATH and default directories alongside manual selection.
+            -   **Enhanced Bypass Patching**: The account eligibility bypass patch now officially supports x86_64 PE (Windows/Linux) binaries. It reliably scans for jump instruction patterns and performs NOP rewrites to unlock local restrictions cross-platform.
+            -   *Related PR*: See [PR #3252](https://github.com/lbjlaq/Antigravity-Manager/pull/3252).
+    *   **v4.4.3 (2026-07-15)**:
+        -   **[Core Feature] Bypass Account Eligibility Check**:
+            -   **One-Click Unblock**: Bypasses the new client's mandatory unauthorized account blocking. Dynamically patches the underlying `agy` ARM64 instruction stream (overwriting `cbz` branches) and performs ad-hoc macOS `codesign` to skip local access control checks seamlessly.
+            -   *Related PR*: See [PR #3248](https://github.com/lbjlaq/Antigravity-Manager/pull/3248).
+        -   **[Core Feature] Accurate Multimodal Token Estimation**:
+            -   **Volume-Proportional Scaling**: Implemented a highly efficient algorithm to estimate token usage for embedded Base64 media (images, audio, video) in OpenAI and Gemini requests. Instead of performing CPU-intensive media decoding, the backend calculates tokens via proportional scaling based on byte volume. Standard images are correctly billed at 258 tokens while very large/high-res payloads dynamically scale up to 10k tokens. Audio and video token lengths are also accurately approximated based on bitrate heuristics.
+            -   *Related PR*: See [PR #3250](https://github.com/lbjlaq/Antigravity-Manager/pull/3250).
+        -   **[Bug Fix] Fix Account Disappearance on Refresh**:
+            -   **UI Visibility Issue**: Fixed a UI bug where an account would accidentally vanish from the "Free/Pro" view filters after its quota was exhausted. Previously, hitting a 403 rate limit would silently overwrite the local quota structure and wipe out the `subscription_tier` string, hiding it from the frontend filters. The system now preserves existing subscription metadata during 403 fallback updates.
+            -   *Related Issue*: See [Issue #3249](https://github.com/lbjlaq/Antigravity-Manager/issues/3249).
+    *   **v4.4.2 (2026-07-13)**:
+        -   **[Core Feature] Enhanced Web Search MCP Integration & Deep Content Reading**:
+            -   **Search Resilience & Failover**: Revamped query parsing and result scoring algorithms. Implemented a robust fallback mechanism that automatically utilizes DuckDuckGo HTML scraping when official search APIs hit rate limits, ensuring continuous connectivity.
+            -   **Clutter-Free Reader Engine**: Integrated a powerful web reading engine (`handle_web_reader`) powered by Readability algorithms. It automatically strips ads and navigation noise from webpages, extracting clean main content and converting it to LLM-friendly Markdown on the fly.
+            -   **Nested Agent Server Spawning**: Extended ZAI dispatch to allow AI agents to seamlessly spawn sub-MCP servers for complex nested toolchains. Overhauled `ClientAdapter` to support enhanced stream forwarding.
+            -   *Related PR*: See [PR #3246](https://github.com/lbjlaq/Antigravity-Manager/pull/3246).
+        -   **[Core Fix] Completely Resolved Windows Concurrency Freezes and Proxy Page Hangs (Tokio Thread Pool Starvation Fix)**:
+            -   **Isolated High-Frequency Sync I/O**: Migrated all synchronous SQLite log writing (`proxy_db::save_log`, `token_stats::record_usage`) out of standard Tokio coroutines and into dedicated `tokio::task::spawn_blocking` thread pools. This entirely eliminates system-wide background blocking, network request interruptions, and application freezes caused by Windows Defender locking database files.
+            -   **Refactored Proxy Page CLI Sync Deadlocks**: Addressed a critical bug where opening the "Proxy" page on Windows completely froze the client due to the `CliSyncCard` component triggering synchronous checks. The underlying `cmd.exe` and `npm` system calls (e.g., `get_cli_sync_status`), along with bulk account file reads, have been wrapped in `spawn_blocking` and refactored to use native `tokio::fs`. The page now loads smoothly without locking the async runtime.
+            -   *Related Issue*: See [Issue #3245](https://github.com/lbjlaq/Antigravity-Manager/issues/3245).
+    *   **v4.4.1 (2026-07-12)**:
+        -   **[Core Fix] Resolve System Tray Exit, Process Residual & Port Occupancy**:
+            -   **Terminate Background Async Tasks**: Explicitly aborts all background scan and monitor tasks in the Token Manager when the user triggers "Quit" from the tray menu, ensuring they don't block Tauri's teardown flow.
+            -   **Guaranteed Process Termination**: Invokes `std::process::exit(0)` after gracefully stopping the admin server. This completely resolves the Windows system tray freeze (where the icon remained visible but unresponsive) and ensures the web proxy port (`8045`) is freed immediately.
+            -   *Related Issue*: See [Issue #3242](https://github.com/lbjlaq/Antigravity-Manager/issues/3242).
+        -   **[Core Fix] Resolve Multi-Turn Tool Call 400 Bad Request Due to Missing Thought Signature (Claude Code Compatibility)**:
+            -   **Multi-Turn Signature Caching**: Refactored the session signature caching mechanism to store a map of message counts to signatures (`HashMap<usize, SessionSignatureEntry>`) instead of caching only the single latest signature per session, ensuring signatures from historical turns are preserved.
+            -   **Precise Signature Recovery**: Updated the request adapter translation logic to pass the current message index through the parser during content construction, and retrieve the exact signature associated with that specific turn index via `get_session_signature_at` to backfill Gemini's `functionCall` elements, preventing 400 validation failures.
+            -   *Related Issue*: See [Issue #3243](https://github.com/lbjlaq/Antigravity-Manager/issues/3243).
+    *   **v4.4.0 (2026-07-11)**:
+        -   **[Core Feature & Fix] Windows Background Throttling & System Tray Freeze Fix**:
+            -   **Disable Efficiency Mode & Power Throttling**: Fixed the issue where Windows aggressively forces the process into "Efficiency Mode" (EcoQoS) when minimized/hidden to the system tray. We programmatically disable Power Throttling via Win32 APIs at startup to restore proper thread priority and CPU Core scheduling.
+            -   **Resolve Gateway Lag & Tray Freezes**: Ensures the Axum proxy listener responds immediately to loopback TCP requests, and the `winit` event loop processes tray click events reliably in the background, eliminating all freeze symptoms.
+            -   *Related Issue*: See [Issue #3241](https://github.com/lbjlaq/Antigravity-Manager/issues/3241).
+        -   **[Core Feature & Optimization] Claude Opus 4.6 Alias Mapping & Live Limit Persistence**:
+            -   **Alias & Parameter Alignment**: Added mapping aliases for `claude-opus-4.6(-thinking)` to target thinking models, enforcing specific `thinkingBudget` and `maxOutputTokens` request bounds during API conversion.
+            -   **Live Upstream Throttle Persistence**: Introduced the `live_limited_models` map to track and persist temporary upstream rate-limiting states locally per account, clearing them automatically upon successful requests.
+            -   **Image Quota Segmentation & Multipart Refinement**: Segmented `gemini-3.1-flash-image` and `gemini-3-pro-image` quotas, enhanced MIME-type auto-detection for Image Edits multipart requests, and aligned error status mapping.
+            -   *Related PR*: See [PR #3240](https://github.com/lbjlaq/Antigravity-Manager/pull/3240).
+    *   **v4.3.9 (2026-07-10)**:
+        -   **[Core Feature & Fix] Gemini Thinking Injection & Native Codex Reasoning Display**:
+            -   **Gemini Thinking Configuration**: Enabled thinking effort configurations and `includeThoughts: true` for `gemini-pro` and `*-pro-agent` / `*-flash-agent` models to allow native thoughts retrieval.
+            -   **Standardized SSE Framing & Lifecycle**: Redesigned the streaming SSE output flow to support sequential numbering (`sequence_number`) and aligned the SSE `event` field with JSON payload `type`s so Codex Desktop resolves lifecycles properly.
+            -   **Reasoning Stream Integration**: Integrated Gemini's thought blocks with Codex's `phase: "commentary"` messages. Safely completes active reasoning blocks before ordinary text or tool executions.
+            -   **Filter Local Thought Entries**: Added `is_codex_transcript_only_assistant_message` to filter out Codex's local thought blocks (`msg_thought_*`) during conversation history mapping, resolving token inflation and prompt context contamination.
+            -   *Related PR*: See [PR #3239](https://github.com/lbjlaq/Antigravity-Manager/pull/3239).
+    *   **v4.3.8 (2026-07-10)**:
+        -   **[Core Fix] Resolve Gemini Token Usage Double-Counting & Inflation**:
+            -   **Precise Format Differentiation**: Accurately differentiated between direct Gemini API (`candidatesTokenCount` which already includes thinking/reasoning tokens) and new Interactions API (`total_output_tokens` which excludes thinking tokens).
+            -   **Prevent Double Counting**: Fixed a bug where `candidatesTokenCount` was incorrectly added together with `thoughtsTokenCount` in both SSE streaming and standard responses, double-counting the reasoning tokens.
+            -   **Middleware Sync**: Aligned the monitor middleware tracker (`monitor.rs` -> `extract_output_tokens`) to ensure logs, database records, and dashboard metrics reflect correct token usage.
+            -   *Related Issue*: See [Issue #3237](https://github.com/lbjlaq/Antigravity-Manager/issues/3237).
+        -   **[Deploy Fix] Resolve Missing universal.dmg Causing macOS Installation & Homebrew Failures**:
+            -   **Dynamic Architecture Detection**: Since the `universal` target DMG packaging is skipped on CI to prevent workflow failures, we refactored `Casks/antigravity-tools.rb` and the one-line install script `install.sh`.
+            -   **Architecture-Aware Resolution**: The installers now detect the actual hardware architecture and download the corresponding `aarch64` (Apple Silicon) or `x64` (Intel) DMG package instead of throwing a 404 error looking for `universal.dmg`.
+            -   *Related Issue*: See [Issue #3238](https://github.com/lbjlaq/Antigravity-Manager/issues/3238).
+    *   **v4.3.7 (2026-07-09)**:
+        -   **[i18n] Complete Korean (ko) Translations**:
+            -   **Filled 149 Missing Keys**: Updated `src/locales/ko.json` to fill in 149 translation keys added since v4.3.0, ensuring a fully localized UI for Korean-speaking users.
+            -   **Addressed Key Areas**: Covered Terminal 403 self-fix guide, Homebrew update flow, thinking budget options (low/medium/high/adaptive effort), OpenCode and Droid sync options, Gemini 3 routing, network monitor details, and auto-update prompts.
+            -   **Maintained Consistency**: Kept the formal polite tone (`-습니다/-니다`) consistent with the existing translation, ensuring all dynamic interpolation placeholders are intact.
+            -   *Related PR*: See [PR #3233](https://github.com/lbjlaq/Antigravity-Manager/pull/3233), contributed by [@moduvoice](https://github.com/moduvoice).
+    *   **v4.3.6 (2026-07-08)**:
+        -   **[Core Refactor] Request Conversion Refactoring & Prompt Alignment**:
+            -   **Standard XML Structure Alignment**: Refactored the conversion logic of Codex's multi-turn `system`/`developer` prompts, automatically classifying and organizing them into standard XML tag structures matching official Antigravity style (containing `<identity>`, `<user_information>`, `<environment_permissions>`, `<skills>`, `<planning_mode>`, etc.), and sending them uniformly as a single `role = "system"` part.
+            -   **Prevent Secondary Injection**: After `convert_codex_to_openai_request` completes conversion, deleted `body.instructions` to prevent duplicate loading in mappers, and added deduplication at the `request.rs` layer. If a `You are Codex` identity is detected, the injection of `You are Antigravity...` is automatically skipped.
+            -   **History Pruning Protection**: Optimized the pruning logic for `apply_patch` parameters and error outputs to avoid abrupt truncation by message count.
+        -   **[Core Fix] Resolve Markdown Base64 Image Token Inflation & Garbled Outputs (Markdown Base64 Image Bloat Fix)**:
+            -   **Regex Interception & Extraction**: Added regex interceptors in OpenAI and Claude mappers to clean up large `![image](data:...)` Base64 image strings embedded in history texts, avoiding massive token inflation.
+            -   **Native Vision Restoration**: Converted the extracted Base64 data back into native `inlineData` image blocks, saving thousands of tokens and eliminating model hallucinations caused by decoding Base64 text.
+        -   **[Core Fix] Resolve Non-Native Model (e.g. Gemini) Reluctance to Invoke Local Skills (Gemini Skill Invocation Fix)**:
+            -   **Prompt Injection Guidance**: Solved the issue where Gemini fails to read local `SKILL.md` files because it lacks a native `view_file` tool and its attention gets diluted in long context lists.
+            -   **Critical Instruction Injection**: Injected a high-priority warning block right before closing the `<skills>` tag, directing the model to run `Get-Content` or `cat` commands via `shell_command` tool to read the skill files, successfully restoring the local skill execution chain.
+        -   **[Multi-turn Dialog] Introduce Interaction Ledger for Accurate Multi-turn Dialogue (Interaction Ledger Integration)**:
+            -   Added `interaction_ledger.rs` to manage Codex multi-turn steps, preserving the mapping between steps and tool calls in the request and streaming pipelines.
+        -   **[Model Config] Fix Missing gemini-pro-agent in Web-Search Permission Whitelist**:
+            -   Added `gemini-pro-agent` to the web-search capability whitelist.
+            -   *Related PR*: See [PR #3230](https://github.com/lbjlaq/Antigravity-Manager/pull/3230).
+    *   **v4.3.5 (2026-07-07)**:
+        -   **[Core Fix] Resolve OpenAI Format Proxy SSE Streaming Reasoning Content Duplication**:
+            -   **Clean Reasoning Stream**: Fixed an issue where the proxy streamed reasoning/thinking process chunks to both `reasoning_content` and `content` fields when proxying Gemini 3.5 Flash series or Gemini 3.1 Pro Low under the OpenAI chat completions protocol (`/v1/chat/completions`). The thinking process now strictly streams to `reasoning_content`, resolving duplicate message bubble rendering in clients.
+            -   *Related Issue*: See [Issue #3227](https://github.com/lbjlaq/Antigravity-Manager/issues/3227).
+    *   **v4.3.4 (2026-07-06)**:
+        -   **[Community Contribution] Merge PR #3225: apply_patch Call Failure Fix & Multi-Layer Cache Optimization**:
+            -   **apply_patch Format Normalization (Tier A Optimization)**: Added a deep pre-processing step (`optimize_patch`) before forwarding patches to Codex, which automatically corrects malformed `@@` hunk headers, missing `+/-` prefix lines, and stray unified diff headers. This significantly reduces `apply_patch` tool call failure rates caused by Gemini output format discrepancies.
+            -   **L2 Tools Multi-Layer Independent Cache (Multi-Layer Split Cache)**: Introduced a three-tier independent `CacheManager` (`si_cache` L1 / `tools_cache` L2 / `prefix_tracker` L3). A Layer 2 cache lookup is now performed in the tool processing pipeline, allowing requests with identical tool sets to reuse processed results across sessions, eliminating redundant computation overhead.
+            -   **Visualized Cached Token Statistics**: Refined monitoring logs to separately record `cached_tokens` and `reasoning_tokens` flow statistics. Responses are now uniformly serialized via `to_responses_usage_value()`, making Responses API token consumption transparent and auditable.
+            -   **Debug Exchange Logger**: Added an optional full-chain request/response debug logger (`debug_logger::write_exchange_payload`) that can persist the original request, upstream Gemini request body, raw response, and converted response to disk as JSON files, greatly improving issue diagnosis efficiency.
+            -   **custom_tool_call Protocol Compatibility**: Enhanced the Responses API (`/v1/responses`) to properly handle `custom_tool_call` and `custom_tool_call_output` item types, including safe skipping of `status: incomplete` items and orphaned output entries, improving multi-tool Codex session robustness.
+            -   *Related PR*: See [PR #3225](https://github.com/lbjlaq/Antigravity-Manager/pull/3225), contributed by [@new-Beginner](https://github.com/new-Beginner).
+    *   **v4.3.3 (2026-07-06)**:
+        -   **[Core Feature] Multi-Protocol Adaptive Context Pressure Capping & XML Summarization (L1~L3 Levels)**:
+            -   **Interface Entry**: Easily configured under the **Experimental Settings (Experimental)** panel in the configuration page. Users can select the compression level (Low / Medium / High) and drag sliders to customize L1/L2/L3 thresholds.
+            -   **Three Protocols Aligned**: Fully supports and aligns Claude protocol, OpenAI protocol, and Gemini native protocol, preventing `400` context-overflow errors globally.
+            -   **Compression Levels Defined**:
+                - `Low (Log Dedup)`: deduplicates and purges terminal output logs.
+                - `Medium (Log + Language)`: adds Caveman style natural language purification to trim conversational noise.
+                - `High (Dynamic Resets)`: unlocks the multi-phase water-level capping mechanism (L1 tool message trimming, L2 reasoning token compression, L3 background XML summary compilation + session Fork resets).
+            -   **Robust Signature Restoration**: Intercepts and caches the latest reasoning signature via `SignatureCache` during compression, satisfying Google upstream verification.
+            -   **Tests & Compatibility**: Added synchronous adapter facades to keep static cleanup compatible, resolving parallel test racing via Mutex isolation.
+    *   **v4.3.2 (2026-07-05)**:
+        -   **[Core Fix] Resolve Tool Call Failures Caused by Hardcoded local_shell_call Mapping (Dynamic Shell Tool Resolution)**:
+            -   **Dynamic Resolution**: Removed the hardcoded logic that unconditionally rewrote all shell-related tool names (`shell`, `bash`, `local_shell`) to `local_shell_call` in both streaming and non-streaming responses. The proxy now dynamically matches and maps the tool name based on the client's declared tools (e.g., `bash` or `shell`).
+            -   **Backward Compatibility**: If no tool list is declared in the request, the mapping defaults to `local_shell_call` to ensure smooth compatibility with legacy clients.
+            -   *Related Issue*: See [Issue #3224](https://github.com/lbjlaq/Antigravity-Manager/issues/3224)
+    *   **v4.3.1 (2026-07-03)**:
+        -   **[Optimization/Fix] Optimize Antigravity IDE Client Detection, Path Resolution, and Cache Support (IDE Detection & Cache Paths)**:
+            -   **Auto-detect IDE Mode**: During account integration sync, if the resolved executable path contains `"antigravity ide"` or `"antigravity-ide"`, it automatically switches to IDE mode and applies the corresponding Keyring account credential logic.
+            -   **Smart Merged Path Detection**: When `target_ide` is `None`, the manager now scans both `Antigravity IDE` and `Antigravity` directories for `state.vscdb` databases and `storage.json` profiles, resolving missing-config issues when no explicit target is specified.
+            -   **IDE Cache Support**: Added support for locating and managing the Electron-based Antigravity IDE cache directory on Windows.
+            -   **Config Path Detection & Strategy Prioritization**: Introduced config-level executable path resolution (Strategy 2) to respect user-configured `antigravity_executable` / `antigravity_ide_executable` paths, while enhancing the traversal of default install locations.
+            -   *Related PR*: See [PR #3220](https://github.com/lbjlaq/Antigravity-Manager/pull/3220)
+    *   **v4.3.0 (2026-07-02)**:
+        -   **[Core Fix] Resolve 400 Errors Caused by System Messages Mixed in Messages during Claude-to-Gemini Mapping (Claude System Message Fix)**:
+            -   **System Message Extraction & Filtering**: In the Claude-to-Gemini request converter, messages with `role == "system"` are extracted and filtered out from the `messages` array, preventing them from being mixed into `contents` which triggers Gemini API `400 INVALID_ARGUMENT` errors.
+            -   **Appended to System Instruction**: The extracted system messages are appended as text blocks to Gemini's `system_instruction` during the `build_system_instruction` phase, ensuring the system prompt remains effective and complies with Gemini's API schema.
+            -   *Related PR*: See [PR #3219](https://github.com/lbjlaq/Antigravity-Manager/pull/3219)
+        -   **[Core Fix / Feature] Introduce Apply Patch Pre-flight & WebSocket Proxy Support (Patch Pre-flight & WS Support)**:
+            -   **Pre-flight Auto-Correction**: Scans and aligns the local target file before applying the V4A patch, automatically correcting harmless formatting issues like trailing spaces or header mismatches, drastically preventing `Failed to find expected lines` failures.
+            -   **Multi-Session Project Directory (CWD) Alignment**: Caches up to 12 recent project `cwd` paths. In multi-session scenarios, it evaluates anchor probes to locate the most relevant directory for incoming patch files, solving context isolation issues in stateless agent loops.
+            -   **WebSocket Proxy Support**: Enabled Axum's WebSocket capabilities and integrated `tokio-tungstenite` dependencies to support real-time stream proxying.
+            -   *Related PR*: See [PR #3214](https://github.com/lbjlaq/Antigravity-Manager/pull/3214)
+    *   **v4.2.9 (2026-06-27)**:
+        -   **[Core Fix] Resolve Codex Agent and Multi-Turn Disconnection Issues under Proxy (Codex Agent Flow Fix)**:
+            -   **SSE Event Reconstruction**: Fixed a critical bug in `/v1/responses` where the proxy stream converter (`create_codex_sse_stream`) silently discarded all tool execution events when the upstream Gemini API returned a `functionCall` part. The proxy now properly serializes and emits the full suite of standard Codex SSE events: `response.output_item.added` (of type `function_call`), `response.function_call_arguments.delta`, `response.function_call_arguments.done`, and `response.output_item.done`.
+            -   **Stream Lifetime Synchronization**: Added all active function call items into the `response.completed` event's `output` array to guide Codex clients in executing local shell/google_search actions; also deferred the initial `response.output_item.added` (type `message`) event until the first non-thought text delta arrives, ensuring clean execution for purely tool-based completions.
+            -   *Related Issue*: See [Issue #3207](https://github.com/lbjlaq/Antigravity-Manager/issues/3207)
+        -   **[UX Enhancement] Enhanced menu visibility settings for custom navigation items (Menu Settings Customization)**:
+            -   Added toggle controls for remaining navigation items in menu settings.
+    *   **v4.2.8 (2026-06-27)**:
+        -   **[Core Fix] Fixed Gemini Native Image Generation Proxy Anomalies & Account Rotation (Gemini Image Gen & Rotation)**:
+            -   **Native Bypass / Decoupling**: Refactored the image model redirection logic to only divert non-native image models (e.g., `dall-e`, `midjourney`). Native Gemini image models (e.g., `gemini-3-pro-image`) now flow directly through the main proxy pipeline, retaining the `size` parameters and preventing upstream API failures caused by the legacy shim's incompatible requests.
+            -   **Account-Level Dynamic Model Resolution**: Enabled account-specific dynamic image model resolution via `resolve_dynamic_model_for_account` to prevent 404 errors (as image model IDs are unique to each account and cannot use static aliases).
+            -   **High-Availability Rotation & Header Tracing**: Added automatic account rotation for image generations when encountering `403` or `404` errors. The proxy also injects the `X-Account-Email` header pointing to the attempted account in error responses to enhance debuggability.
+            -   **Strict Tier-Based Drift Constraints**: Restricted image model version drift in `TokenManager` to remain strictly within the same tier (`pro-image` to `pro-image`, `flash-image` to `flash-image`) to prevent silent quality downgrades from Pro to Flash.
+            -   *Related PR*: See [PR #3206](https://github.com/lbjlaq/Antigravity-Manager/pull/3206)
+        -   **[UX Enhancement] Enhanced Tray Multilingual Sync & API Integration Templates (Tray i18n & API Examples)**:
+            -   **Tray Menu Localization Follow**: Expanded the Rust tray menu's translation loader to support all client-supported languages (including Simplified/Traditional Chinese, Japanese, Korean, Russian, Arabic, Spanish, Portuguese, Malay, etc.) for real-time synchronization, with unknown locales defaulting to `en`.
+            -   **Example Guidelines & Korean Localization**: Translated comments inside API Proxy Python templates to English and added detailed instructions for image size mappings, model suffix utilization, and Base64 output extraction; also updated Korean translation strings (`ko.json`).
+            -   *Related PR*: See [PR #3206](https://github.com/lbjlaq/Antigravity-Manager/pull/3206)
+        -   **[Security Fix] Fixed Accidental Account Proxy Bindings Reset on Config Save (Account Proxy Bindings Loss Fix)**:
+            -   **Bug Fix**: Fixed a bug where the frontend `ProxyPoolSettings` component omitted the `account_bindings` field when building the config object during `onChange` updates. This caused custom account-to-proxy mappings on disk to be overwritten and reset to empty whenever other settings were saved. With this fix, bindings are preserved correctly across restarts and saves, preventing potential account bans from multiple accounts using a single IP.
+            -   *Related Issue*: See [Issue #3205](https://github.com/lbjlaq/Antigravity-Manager/issues/3205)
+    *   **v4.2.7 (2026-06-24)**:
+        -   **[New Feature] Introducing APIKEY.FUN Official Hub Partner**:
+            -   **Dedicated Integration Panel**: Brand new built-in APIKEY.FUN hub panel providing reliable and cost-effective access to premium LLM APIs. Supports centralized API key management, auto quota inquiries, and usage tracking.
+            -   **One-Click IDE Sync**: Seamlessly sync your hub API key and custom base URL to local coding environments like Codex or Claude Code with just one click.
+        -   **[Core Fix] Fixed HTTP/429 Exhaustion Polling Interruptions & Quota Display Sync**:
+            -   **Retry Logic Resolution**: Resolved a scoping error with the `force_rotate` state during HTTP 429 error handling. Now, when the proxy encounters a `429 Too Many Requests` or `INSUFFICIENT_G1_CREDITS_BALANCE`, it successfully bypasses useless fallback nodes and instantly forces an account rotation within the global retry loop, eliminating unnecessary blocking waits.
+            -   **Real-time Quota Sync**: Fixed an issue where free accounts (e.g. HK/CN regions) encountering HTTP/429 quota exhaustion still displayed a 100% quota because the Google `v1internal/models` API omits credit limitations. The proxy now seamlessly merges the backend `TokenManager`'s in-memory rate-limiting lock into the frontend quota queries, instantly displaying 0% quota and accurate reset times on the dashboard.
+    *   **v4.2.7 (2026-06-22)**:
+        -   **[Core Fix] Resolve 400 Error for Gemini Function Calling due to Missing thought_signature (Gemini Tool Calling Fix)**:
+            -   **Bug Fix**: Fixed a `400 INVALID_ARGUMENT` error (specifically `Function call is missing a thought_signature`) during multi-turn tool calling when the proxy sent camelCase `thoughtSignature` to the `/v1internal` endpoint, which strictly requires snake_case `thought_signature`.
+            -   **Dual Compatibility**: Updated OpenAI mapper, Claude mapper, and Gemini wrapper to dual-inject both `thoughtSignature` and `thought_signature` fields. Also added a serde alias to safely deserialize both camelCase and snake_case signatures from Gemini backend responses ([Issue #3202](https://github.com/lbjlaq/Antigravity-Manager/issues/3202)).
+    *   **v4.2.5 (2026-06-20)**:
+        -   **[Proxy Fix] Strip Boolean Sub-schemas from Tool Parameters**:
+            -   **Bug Fix**: Fixed a `400 INVALID_ARGUMENT` error where tool parameters containing nested boolean sub-schemas (e.g., `"someProp": false`) were rejected by Gemini's Schema proto (which requires every property/item value to be an Object).
+            -   **Filtering**: Updated `clean_json_schema_recursive` to drop non-object properties (and remove them from `required`) and non-object `items` values, ensuring complete compatibility with the upstream Gemini API schema requirements and returning `200` ([PR #3197](https://github.com/lbjlaq/Antigravity-Manager/pull/3197)).
+        -   **[Streaming Fix] Remove __cloudCodeMeta Metadata from OpenAI Streaming Response (Remove __cloudCodeMeta)**:
+            -   **Bug Fix**: Fixed a `AI_TypeValidationError` issue where third-party generic clients (e.g., Cherry Studio) crashed due to strict Zod validation on incoming SSE stream chunks when receiving the non-standard `{"__cloudCodeMeta": {"traceId": ...}}` header injected at the start of the stream.
+    *   **v4.2.4 (2026-06-17)**:
+        -   **[Core Fix] Fixed History Session Loss Bug on IDE Account Switch (History Loss Fix)**:
+            -   **Bug Fix**: Fixed an issue where violently overwriting `antigravityUnifiedStateSync.oauthToken` during OAuth credential injection accidentally erased `authStateWithContextSentinelKey` and other vital states stored in the same topic.
+            -   **Merge Injection**: Refactored the underlying Protobuf binary protocol parsing to implement a secure merge injection logic for the new state dictionary. Now, when switching accounts, the system perfectly preserves the existing project context and login state records, preventing the IDE from unexpectedly clearing historical dialogs due to incomplete states.
+        -   **[Core Fix] Resolve State Synchronization Conflicts during Antigravity CLI (agy) Account Switching (CLI Sync Isolation)**:
+            -   **State Isolation**: Introduced the `current_target_ide` field into the underlying account index to precisely track the target environment of account switches.
+            -   **Conflict Avoidance**: Enhanced the automatic synchronization logic so that if the current target environment is `agy`, the system proactively skips state sync fetch and rewrite, preventing CLI-specific temporary credentials from colliding with the Manager's main interface environment ([PR #3186](https://github.com/lbjlaq/Antigravity-Manager/pull/3186)).
     *   **v4.2.3 (2026-06-16)**:
         -   **[UX Enhancement] Optimize Homebrew installation to eliminate "App is damaged" warnings (Brew Cask Quarantine Auto-Clear)**:
             -   **Bug Fix**: Added a postflight hook to the macOS Homebrew Cask configuration to automatically remove the `com.apple.quarantine` attribute, fully resolving the "App is damaged" security warning upon first launch ([PR #3180](https://github.com/lbjlaq/Antigravity-Manager/pull/3180)).
@@ -2334,6 +2674,13 @@ print(response.choices[0].message.content)
 <a href="https://github.com/Jint8888"><img src="https://github.com/Jint8888.png" width="50px" style="border-radius: 50%;" alt="Jint8888"/></a>
 <a href="https://github.com/0-don"><img src="https://github.com/0-don.png" width="50px" style="border-radius: 50%;" alt="0-don"/></a>
 <a href="https://github.com/dlukt"><img src="https://github.com/dlukt.png" width="50px" style="border-radius: 50%;" alt="dlukt"/></a>
+<a href="https://github.com/Silviovespoli"><img src="https://github.com/Silviovespoli.png" width="50px" style="border-radius: 50%;" alt="Silviovespoli"/></a>
+<a href="https://github.com/i-smile"><img src="https://github.com/i-smile.png" width="50px" style="border-radius: 50%;" alt="i-smile"/></a>
+<a href="https://github.com/jalen0x"><img src="https://github.com/jalen0x.png" width="50px" style="border-radius: 50%;" alt="jalen0x"/></a>
+<a href="https://linux.do/u/wendavid"><img src="https://linux.do/user_avatar/linux.do/wendavid/48/122218_2.png" width="50px" style="border-radius: 50%;" alt="wendavid"/></a>
+<a href="https://github.com/byte-sunlight"><img src="https://github.com/byte-sunlight.png" width="50px" style="border-radius: 50%;" alt="byte-sunlight"/></a>
+<a href="https://github.com/jlcodes99"><img src="https://github.com/jlcodes99.png" width="50px" style="border-radius: 50%;" alt="jlcodes99"/></a>
+<a href="https://github.com/Vucius"><img src="https://github.com/Vucius.png" width="50px" style="border-radius: 50%;" alt="Vucius"/></a>
 <a href="https://github.com/Koshikai"><img src="https://github.com/Koshikai.png" width="50px" style="border-radius: 50%;" alt="Koshikai"/></a>
 <a href="https://github.com/hakanyalitekin"><img src="https://github.com/hakanyalitekin.png" width="50px" style="border-radius: 50%;" alt="hakanyalitekin"/></a>
 <a href="https://github.com/Gok-tug"><img src="https://github.com/Gok-tug.png" width="50px" style="border-radius: 50%;" alt="Gok-tug"/></a>
@@ -2347,9 +2694,11 @@ This project has referenced or learned from the ideas or code of the following e
 *   [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)
 *   [Practical-Guide-to-Context-Engineering](https://github.com/WakeUp-Jin/Practical-Guide-to-Context-Engineering)
 *   [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+*   [OmniRoute](https://github.com/diegosouzapw/OmniRoute)
 *   [antigravity-claude-proxy](https://github.com/badrisnarayanan/antigravity-claude-proxy)
 *   [aistudio-gemini-proxy](https://github.com/zhongruichen/aistudio-gemini-proxy)
 *   [gcli2api](https://github.com/su-kaka/gcli2api)
+*   [agent-vibes](https://github.com/funny-vibes/agent-vibes)
 
 *   **License**: **CC BY-NC-SA 4.0**. Strictly for non-commercial use.
 *   **Security**: All account data is encrypted and stored locally in a SQLite database. Data never leaves your device unless sync is enabled.
@@ -2358,5 +2707,5 @@ This project has referenced or learned from the ideas or code of the following e
 
 <div align="center">
   <p>If you find this tool helpful, please give it a ⭐️ on GitHub!</p>
-  <p>Copyright © 2025 Antigravity Team.</p>
+  <p>Copyright © 2024-2026 Antigravity Team.</p>
 </div>

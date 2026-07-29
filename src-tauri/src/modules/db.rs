@@ -14,69 +14,87 @@ fn get_antigravity_path(target_ide: Option<&str>) -> Option<PathBuf> {
     crate::modules::process::get_antigravity_executable_path(target_ide)
 }
 
-/// Get Antigravity database path (cross-platform)
-pub fn get_db_path(target_ide: Option<&str>) -> Result<PathBuf, String> {
-    // Prefer path specified by --user-data-dir argument
+/// Get all possible Antigravity database candidate paths
+pub fn get_all_candidate_db_paths(target_ide: Option<&str>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
     if let Some(user_data_dir) = crate::modules::process::get_user_data_dir_from_process(target_ide)
     {
-        let custom_db_path = user_data_dir
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb");
-        if custom_db_path.exists() {
-            return Ok(custom_db_path);
-        }
-    }
-
-    // Check if in portable mode
-    if let Some(antigravity_path) = get_antigravity_path(target_ide) {
-        if let Some(parent_dir) = antigravity_path.parent() {
-            let portable_db_path = PathBuf::from(parent_dir)
-                .join("data")
-                .join("user-data")
+        paths.push(
+            user_data_dir
                 .join("User")
                 .join("globalStorage")
-                .join("state.vscdb");
+                .join("state.vscdb"),
+        );
+    }
 
-            if portable_db_path.exists() {
-                return Ok(portable_db_path);
-            }
+    if let Some(antigravity_path) = get_antigravity_path(target_ide) {
+        if let Some(parent_dir) = antigravity_path.parent() {
+            paths.push(
+                PathBuf::from(parent_dir)
+                    .join("data")
+                    .join("user-data")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("state.vscdb"),
+            );
         }
     }
 
-    let folder_name = if target_ide == Some("ide") {
-        "Antigravity IDE"
+    let folder_names: &[&str] = if target_ide == Some("ide") {
+        &["Antigravity IDE", "Antigravity"]
+    } else if target_ide == Some("code") || target_ide == Some("cursor") {
+        &["Antigravity", "Antigravity IDE"]
     } else {
-        "Antigravity"
+        &["Antigravity IDE", "Antigravity"]
     };
 
-    // Standard mode: use system default path
     #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir().ok_or("Failed to get home directory")?;
-        Ok(home.join(format!(
-            "Library/Application Support/{}/User/globalStorage/state.vscdb",
-            folder_name
-        )))
+    if let Some(home) = dirs::home_dir() {
+        for folder_name in folder_names {
+            paths.push(home.join(format!(
+                "Library/Application Support/{}/User/globalStorage/state.vscdb",
+                folder_name
+            )));
+        }
     }
 
     #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA")
-            .map_err(|_| "Failed to get APPDATA environment variable".to_string())?;
-        Ok(PathBuf::from(appdata)
-            .join(folder_name)
-            .join("User\\globalStorage\\state.vscdb"))
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        for folder_name in folder_names {
+            paths.push(
+                PathBuf::from(&appdata)
+                    .join(folder_name)
+                    .join("User\\globalStorage\\state.vscdb"),
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
-    {
-        let home = dirs::home_dir().ok_or("Failed to get home directory")?;
-        Ok(home.join(format!(
-            ".config/{}/User/globalStorage/state.vscdb",
-            folder_name
-        )))
+    if let Some(home) = dirs::home_dir() {
+        for folder_name in folder_names {
+            paths.push(home.join(format!(
+                ".config/{}/User/globalStorage/state.vscdb",
+                folder_name
+            )));
+        }
     }
+
+    paths
+}
+
+/// Get Antigravity database path (cross-platform)
+pub fn get_db_path(target_ide: Option<&str>) -> Result<PathBuf, String> {
+    let candidates = get_all_candidate_db_paths(target_ide);
+    for path in &candidates {
+        if path.exists() {
+            return Ok(path.clone());
+        }
+    }
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Failed to locate database path".to_string())
 }
 
 /// Inject Token and Email into database
@@ -145,11 +163,33 @@ fn inject_new_format(
         id_token,
         Some(email),
     );
-    let outer_b64 = protobuf::create_unified_state_entry("oauthTokenInfoSentinelKey", &oauth_info);
+
+    use base64::{engine::general_purpose, Engine as _};
+    use rusqlite::OptionalExtension;
+
+    let current_topic = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?",
+            ["antigravityUnifiedStateSync.oauthToken"],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to read oauthToken: {}", e))?
+        .map(|val| general_purpose::STANDARD.decode(val).unwrap_or_default())
+        .unwrap_or_default();
+
+    let mut topic =
+        protobuf::remove_unified_topic_entry(&current_topic, "oauthTokenInfoSentinelKey")?;
+    topic.extend(protobuf::create_unified_topic_entry(
+        "oauthTokenInfoSentinelKey",
+        &oauth_info,
+    ));
+
+    let topic_b64 = general_purpose::STANDARD.encode(&topic);
 
     conn.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-        ["antigravityUnifiedStateSync.oauthToken", &outer_b64],
+        ["antigravityUnifiedStateSync.oauthToken", &topic_b64],
     )
     .map_err(|e| format!("Failed to write new format: {}", e))?;
 
@@ -167,6 +207,13 @@ fn inject_new_format(
         ["antigravityOnboarding", "true"],
     )
     .map_err(|e| format!("Failed to write onboarding flag: {}", e))?;
+
+    // Fix for missing history: Delete the old format state to prevent the IDE from reading a stale UserID
+    // which causes history fetching to fail.
+    let _ = conn.execute(
+        "DELETE FROM ItemTable WHERE key = ?",
+        ["jetskiStateSync.agentManagerInitState"],
+    );
 
     Ok("Token injection successful (new format)".to_string())
 }

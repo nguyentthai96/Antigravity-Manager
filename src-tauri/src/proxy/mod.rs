@@ -9,11 +9,13 @@ pub mod token_manager;
 
 // 新架构模块
 pub mod audio; // 音频处理模块
+pub mod cache_manager; // Context Cache 管理 (前缀哈希 → cache_id 映射)
 pub mod cli_sync; // CLI 配置同步 (v3.3.35)
 pub mod common; // 公共工具
 pub mod debug_logger;
 pub mod droid_sync; // Droid (Factory CLI) 配置同步
 pub mod handlers; // API 端点处理器
+pub mod http_session_store; // HTTP多轮对话会话历史存储
 pub mod mappers; // 协议转换器
 pub mod middleware; // Axum 中间件
 pub mod model_specs; // 模型规格管理 (v4.1.29)
@@ -44,3 +46,5 @@ pub use token_manager::TokenManager;
 
 #[cfg(test)]
 pub mod tests;
+
+pub mod adapters;

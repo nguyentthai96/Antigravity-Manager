@@ -1,6 +1,7 @@
-import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock } from 'lucide-react';
+import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock, Clock } from 'lucide-react';
 import { Account } from '../../types/account';
 import { formatTimeRemaining } from '../../utils/format';
+import { findQuotaModel, getModelProtectionKey, getModelDisplayName, findImageQuotaModel } from '../../config/modelConfig';
 
 interface CurrentAccountProps {
     account: Account | null;
@@ -25,26 +26,18 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         );
     }
 
-    const geminiProModel = account.quota?.models
-        .filter(m =>
-            m.name.toLowerCase() === 'gemini-3-pro-high'
-            || m.name.toLowerCase() === 'gemini-3-pro-low'
-            || m.name.toLowerCase() === 'gemini-3.1-pro-high'
-            || m.name.toLowerCase() === 'gemini-3.1-pro-low'
-        )
-        .sort((a, b) => (a.percentage || 0) - (b.percentage || 0))[0];
+    const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
+    const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
 
-    const geminiFlashModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-flash');
+    const geminiImageModel = findImageQuotaModel(account.quota?.models);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
+    const liveImageLimit = imageProtectionKey
+        ? account.live_limited_models?.[imageProtectionKey]
+        : undefined;
+    const isImageLiveLimited = Boolean(liveImageLimit && liveImageLimit.until > nowSeconds);
 
-    const geminiImageModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-image');
-
-    const claudeGroupNames = [
-        'claude-opus-4-6-thinking',
-        'claude'
-    ];
-    const claudeModel = account.quota?.models
-        .filter(m => claudeGroupNames.includes(m.name.toLowerCase()))
-        .sort((a, b) => (a.percentage || 0) - (b.percentage || 0))[0];
+    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
 
     return (
         <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
@@ -100,7 +93,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
                                 {(account.protected_models?.includes('gemini-3-pro-high') || account.protected_models?.includes('gemini-3.1-pro-high')) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                Gemini 3.1 Pro
+                                {getModelDisplayName(geminiProModel)}
                             </span>
                             <div className="flex items-center gap-2">
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiProModel.reset_time).toLocaleString()}`}>
@@ -129,8 +122,9 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     <div className="space-y-1.5">
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes('gemini-3-pro-image') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                Gemini 3 Pro Image
+                                {isImageLiveLimited && <Clock className="w-2.5 h-2.5 text-amber-500" />}
+                                {(imageProtectionKey && account.protected_models?.includes(imageProtectionKey)) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
+                                {getModelDisplayName(geminiImageModel)}
                             </span>
                             <div className="flex items-center gap-2">
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiImageModel.reset_time).toLocaleString()}`}>
@@ -161,7 +155,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
                                 {account.protected_models?.includes('gemini-3-flash') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                Gemini 3 Flash
+                                {getModelDisplayName(geminiFlashModel)}
                             </span>
                             <div className="flex items-center gap-2">
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiFlashModel.reset_time).toLocaleString()}`}>
@@ -192,7 +186,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
                                 {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                Claude 系列
+                                {getModelDisplayName(claudeModel, t('common.claude_series', 'Claude 系列'))}
                             </span>
                             <div className="flex items-center gap-2">
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(claudeModel.reset_time).toLocaleString()}`}>

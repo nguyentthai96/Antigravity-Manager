@@ -61,7 +61,6 @@ fn build_safety_settings() -> Value {
         { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": threshold_str },
         { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": threshold_str },
         { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": threshold_str },
-        { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": threshold_str },
     ])
 }
 
@@ -347,6 +346,29 @@ pub fn transform_claude_request_in(
     // 原封不动发回导致的 "Extra inputs are not permitted" 错误
     let mut cleaned_req = claude_req.clone();
 
+    // [CRITICAL FIX] 提取并过滤 role == "system" 的消息，防止混入 contents 导致 Gemini 返回 400 INVALID_ARGUMENT
+    let mut extra_system_messages = Vec::new();
+    let mut filtered_messages = Vec::new();
+    for msg in cleaned_req.messages {
+        if msg.role == "system" {
+            match &msg.content {
+                MessageContent::String(text) => {
+                    extra_system_messages.push(text.clone());
+                }
+                MessageContent::Array(blocks) => {
+                    for block in blocks {
+                        if let ContentBlock::Text { text } = block {
+                            extra_system_messages.push(text.clone());
+                        }
+                    }
+                }
+            }
+        } else {
+            filtered_messages.push(msg);
+        }
+    }
+    cleaned_req.messages = filtered_messages;
+
     // [FIX #813] 合并连续的同角色消息 (Consecutive User Messages)
     // 确保请求符合 Anthropic 和 Gemini 的角色交替协议
     merge_consecutive_messages(&mut cleaned_req.messages);
@@ -425,8 +447,12 @@ pub fn transform_claude_request_in(
     }
 
     // 1. System Instruction (注入动态身份防护 & MCP XML 协议)
-    let system_instruction =
-        build_system_instruction(&claude_req.system, &claude_req.model, has_mcp_tools);
+    let system_instruction = build_system_instruction(
+        &claude_req.system,
+        &claude_req.model,
+        has_mcp_tools,
+        &extra_system_messages,
+    );
 
     //  Map model name (Use standard mapping)
     // [IMPROVED] 提取 web search 模型为常量，便于维护
@@ -474,9 +500,8 @@ pub fn transform_claude_request_in(
         || mapped_model.contains("gemini-2.0-pro")
         || (mapped_model.contains("gemini-3-pro") && !mapped_model.contains("-high") && !mapped_model.contains("-low"))
         || (mapped_model.contains("gemini-3.1-pro") && !mapped_model.contains("-high") && !mapped_model.contains("-low"))
-        // [FIX #2167] gemini-3-flash / gemini-3.1-flash 支持 thinking，必须纳入识别范围
-        || mapped_model.contains("gemini-3-flash")
-        || mapped_model.contains("gemini-3.1-flash");
+        // [FIX #2167] gemini-*-flash 支持 thinking，必须纳入识别范围
+        || (mapped_model.contains("gemini") && (mapped_model.contains("flash") || mapped_model.contains("-flash-")));
 
     if is_thinking_enabled && !target_model_supports_thinking {
         tracing::warn!(
@@ -734,9 +759,11 @@ fn should_enable_thinking_by_default(model: &str) -> bool {
         return true;
     }
 
-    // [FEATURE] 为 gemini-3-flash / gemini-3.1-flash 自动开启 thinking
+    // [FEATURE] 为 gemini-*-flash 自动开启 thinking
     // 让 Cherry Studio 等客户端即使未显式传 thinking.type 也能获取思维链内容
-    if model_lower.contains("gemini-3-flash") || model_lower.contains("gemini-3.1-flash") {
+    if model_lower.contains("gemini")
+        && (model_lower.contains("flash") || model_lower.contains("-flash-"))
+    {
         tracing::debug!(
             "[Thinking-Mode] Auto-enabling thinking for Flash model: {}",
             model
@@ -818,6 +845,7 @@ fn build_system_instruction(
     system: &Option<SystemPrompt>,
     _model_name: &str,
     has_mcp_tools: bool,
+    extra_system_messages: &[String],
 ) -> Option<Value> {
     let mut parts = Vec::new();
 
@@ -877,6 +905,13 @@ fn build_system_instruction(
         }
     }
 
+    // 添加提取出来的 role == "system" 消息
+    for extra_text in extra_system_messages {
+        if !extra_text.trim().is_empty() {
+            parts.push(json!({"text": format!("\n{}", extra_text)}));
+        }
+    }
+
     // [NEW] MCP XML Bridge: 如果存在 mcp__ 开头的工具，注入专用的调用协议
     // 这能有效规避部分 MCP 链路在标准的 tool_use 协议下解析不稳的问题
     if has_mcp_tools {
@@ -908,6 +943,7 @@ fn build_contents(
     _claude_req: &ClaudeRequest,
     is_thinking_enabled: bool,
     session_id: &str,
+    msg_index: usize,
     allow_dummy_thought: bool,
     is_retry: bool,
     tool_id_to_name: &mut HashMap<String, String>,
@@ -932,7 +968,11 @@ fn build_contents(
             if text != "(no content)" {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    parts.push(json!({"text": trimmed}));
+                    parts.extend(
+                        crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
+                            trimmed,
+                        ),
+                    );
                 }
             }
         }
@@ -956,7 +996,11 @@ fn build_contents(
                                 }
                             }
 
-                            parts.push(json!({"text": text}));
+                            parts.extend(
+                                crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
+                                    text,
+                                ),
+                            );
                             saw_non_thinking = true;
 
                             // 记录最近一次 User 任务文本用于后续比对
@@ -1053,7 +1097,8 @@ fn build_contents(
                                     let mut part = json!({
                                         "text": thinking,
                                         "thought": true,
-                                        "thoughtSignature": sig
+                                        "thoughtSignature": sig.clone(),
+                                        "thought_signature": sig
                                     });
                                     crate::proxy::common::json_schema::clean_json_schema(&mut part);
                                     parts.push(part);
@@ -1070,7 +1115,8 @@ fn build_contents(
                                         let mut part = json!({
                                             "text": thinking,
                                             "thought": true,
-                                            "thoughtSignature": sig
+                                            "thoughtSignature": sig.clone(),
+                                            "thought_signature": sig
                                         });
                                         crate::proxy::common::json_schema::clean_json_schema(
                                             &mut part,
@@ -1170,12 +1216,22 @@ fn build_contents(
                             .or(last_thought_signature.as_ref())
                             .cloned()
                             .or_else(|| {
-                                // [NEW v3.3.17] Try session-based signature cache first (Layer 3)
-                                // This provides conversation-level isolation
+                                // Try session-based signature cache at specific msg_index first (Layer 3)
+                                crate::proxy::SignatureCache::global().get_session_signature_at(session_id, msg_index)
+                                    .map(|s| {
+                                        tracing::info!(
+                                            "[Claude-Request] Recovered signature from SESSION cache at turn {} (session: {}, len: {})",
+                                            msg_index, session_id, s.len()
+                                        );
+                                        s
+                                    })
+                            })
+                            .or_else(|| {
+                                // Fallback to latest session signature
                                 crate::proxy::SignatureCache::global().get_session_signature(session_id)
                                     .map(|s| {
                                         tracing::info!(
-                                            "[Claude-Request] Recovered signature from SESSION cache (session: {}, len: {})",
+                                            "[Claude-Request] Recovered latest signature from SESSION cache (session: {}, len: {})",
                                             session_id, s.len()
                                         );
                                         s
@@ -1258,6 +1314,7 @@ fn build_contents(
                                     };
                                     if should_use_sig {
                                         part["thoughtSignature"] = json!(sig);
+                                        part["thought_signature"] = json!(sig);
                                     }
                                 }
                             }
@@ -1268,6 +1325,8 @@ fn build_contents(
                             if is_thinking_enabled && !is_google_cloud {
                                 tracing::debug!("[Tool-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", id);
                                 part["thoughtSignature"] =
+                                    json!("skip_thought_signature_validator");
+                                part["thought_signature"] =
                                     json!("skip_thought_signature_validator");
                             }
                         }
@@ -1366,6 +1425,7 @@ fn build_contents(
                         // [FIX] Tool Result 也需要回填签名（如果上下文中有）
                         if let Some(sig) = last_thought_signature.as_ref() {
                             part["thoughtSignature"] = json!(sig);
+                            part["thought_signature"] = json!(sig);
                         }
 
                         parts.push(part);
@@ -1426,6 +1486,7 @@ fn build_contents(
         let has_thought_part = parts.iter().any(|p| {
             p.get("thought").and_then(|v| v.as_bool()).unwrap_or(false)
                 || p.get("thoughtSignature").is_some()
+                || p.get("thought_signature").is_some()
                 || p.get("thought").and_then(|v| v.as_str()).is_some() // 某些情况下可能是 text + thought: true 的组合
         });
 
@@ -1446,7 +1507,9 @@ fn build_contents(
             // [Crucial Check] 即使有 thought 块，也必须保证它位于 parts 的首位 (Index 0)
             // 且必须包含 thought: true 标记
             let first_is_thought = parts.get(0).map_or(false, |p| {
-                (p.get("thought").is_some() || p.get("thoughtSignature").is_some())
+                (p.get("thought").is_some()
+                    || p.get("thoughtSignature").is_some()
+                    || p.get("thought_signature").is_some())
                     && p.get("text").is_some() // 对于 v1internal，通常 text + thought: true 才是合规的思维块
             });
 
@@ -1481,6 +1544,7 @@ fn build_google_content(
     claude_req: &ClaudeRequest,
     is_thinking_enabled: bool,
     session_id: &str,
+    msg_index: usize,
     allow_dummy_thought: bool,
     is_retry: bool,
     tool_id_to_name: &mut HashMap<String, String>,
@@ -1538,6 +1602,7 @@ fn build_google_content(
         claude_req,
         is_thinking_enabled,
         session_id,
+        msg_index,
         allow_dummy_thought,
         is_retry,
         tool_id_to_name,
@@ -1597,12 +1662,13 @@ fn build_google_contents(
         }
     }
 
-    for (_i, msg) in messages.iter().enumerate() {
+    for (i, msg) in messages.iter().enumerate() {
         let google_content = build_google_content(
             msg,
             claude_req,
             is_thinking_enabled,
             session_id,
+            i,
             allow_dummy_thought,
             is_retry,
             tool_id_to_name,
@@ -2030,6 +2096,7 @@ pub fn clean_thinking_fields_recursive(val: &mut Value) {
         Value::Object(map) => {
             map.remove("thought");
             map.remove("thoughtSignature");
+            map.remove("thought_signature");
             for (_, v) in map.iter_mut() {
                 clean_thinking_fields_recursive(v);
             }

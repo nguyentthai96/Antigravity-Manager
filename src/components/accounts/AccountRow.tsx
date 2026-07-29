@@ -3,6 +3,8 @@ import { Account } from '../../types/account';
 import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
+import { formatCompactDuration, getLiveLimitForModel, getLiveLimitState } from '../../utils/liveLimit';
+import { getModelProtectionKey, findQuotaModel, findImageQuotaModel } from '../../config/modelConfig';
 
 interface AccountRowProps {
     account: Account;
@@ -24,27 +26,27 @@ interface AccountRowProps {
 
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
-    // [重构] 按组聚合查找逻辑，优先显示组内配额最低的型号以与锁定状态（🔒）对齐
-    const geminiProModel = account.quota?.models
-        .filter(m =>
-            m.name.toLowerCase() === 'gemini-3-pro-high'
-            || m.name.toLowerCase() === 'gemini-3-pro-low'
-            || m.name.toLowerCase() === 'gemini-3.1-pro-high'
-            || m.name.toLowerCase() === 'gemini-3.1-pro-low'
-        )
-        .sort((a, b) => (a.percentage || 0) - (b.percentage || 0))[0];
+    // [重构] 按优先级查找配额模型
+    const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
+    const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
 
-    const geminiFlashModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-flash');
+    const geminiImageModel = findImageQuotaModel(account.quota?.models);
+    const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
+    const liveImageLimit = getLiveLimitForModel(account, geminiImageModel?.name, imageProtectionKey ?? undefined);
+    const liveImageState = getLiveLimitState(liveImageLimit);
+    const isImageLiveLimited = liveImageState.shouldShow;
+    const imageLimitTitle = liveImageLimit
+        ? [
+            liveImageState.isActive
+                ? `Live image endpoint is temporarily unavailable for ${formatCompactDuration(liveImageState.secondsRemaining)}.`
+                : `Image endpoint returned ${liveImageLimit.status} ${formatCompactDuration(liveImageState.secondsAgo)} ago.`,
+            `Reason: ${liveImageLimit.reason}.`,
+            `Quota snapshot can still show ${geminiImageModel?.percentage || 0}%.`,
+            liveImageLimit.message ? `Message: ${liveImageLimit.message}` : null,
+        ].filter(Boolean).join(' ')
+        : 'Gemini 3.1 Flash Image';
 
-    const geminiImageModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-image');
-
-    const claudeGroupNames = [
-        'claude-opus-4-6-thinking',
-        'claude'
-    ];
-    const claudeModel = account.quota?.models
-        .filter(m => claudeGroupNames.includes(m.name.toLowerCase()))
-        .sort((a, b) => (a.percentage || 0) - (b.percentage || 0))[0];
+    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
     const isDisabled = Boolean(account.disabled);
 
     // 颜色映射，避免动态类名被 Tailwind purge
@@ -168,7 +170,11 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 ) : (
                     <div className="grid grid-cols-2 gap-x-4 gap-y-1 py-0">
                         {/* Gemini Pro */}
-                        <div className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
+                        <div className={cn(
+                            "relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota",
+                            isImageLiveLimited && "border-amber-400/70 dark:border-amber-500/70 bg-amber-50/80 dark:bg-amber-950/30 ring-1 ring-amber-400/30",
+                            liveImageState.isActive && "border-rose-400/70 dark:border-rose-500/70 bg-rose-50/80 dark:bg-rose-950/30 ring-rose-400/30"
+                        )}>
                             {geminiProModel && (
                                 <div
                                     className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiProModel.percentage)}`}
@@ -240,8 +246,9 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 />
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Gemini 3 Pro Image">
-                                    {account.protected_models?.includes('gemini-3-pro-image') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title={imageLimitTitle}>
+                                    {isImageLiveLimited && <Clock className={cn("w-2.5 h-2.5 shrink-0 z-10", liveImageState.isActive ? "text-rose-500" : "text-amber-500")} />}
+                                    {(imageProtectionKey && account.protected_models?.includes(imageProtectionKey)) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
                                     <span className="truncate">G3 Image</span>
                                 </span>
                                 <div className="flex-1 flex justify-center">
@@ -255,10 +262,11 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                     )}
                                 </div>
                                 <span className={cn("w-[36px] text-right font-bold transition-colors",
-                                    getQuotaColor(geminiImageModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
+                                    isImageLiveLimited ? (liveImageState.isActive ? 'text-rose-600 dark:text-rose-400' : 'text-amber-600 dark:text-amber-400') :
+                                        getQuotaColor(geminiImageModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
                                         getQuotaColor(geminiImageModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
                                 )}>
-                                    {geminiImageModel ? `${geminiImageModel.percentage}%` : '-'}
+                                    {isImageLiveLimited ? `${liveImageLimit?.status || 'ERR'}` : (geminiImageModel ? `${geminiImageModel.percentage}%` : '-')}
                                 </span>
                             </div>
                         </div>

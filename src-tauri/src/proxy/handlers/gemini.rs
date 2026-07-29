@@ -13,7 +13,7 @@ use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
     apply_retry_strategy, determine_retry_strategy, should_rotate_account,
 };
-use crate::proxy::mappers::gemini::{unwrap_response, wrap_request};
+use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
 use crate::proxy::session_manager::SessionManager;
 use crate::proxy::upstream::client::mask_email;
@@ -93,6 +93,7 @@ pub async fn handle_generate(
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    let mut force_rotate = false;
 
     for attempt in 0..max_attempts {
         // 3. 模型路由解析
@@ -131,11 +132,11 @@ pub async fn handle_generate(
         // 提取 SessionId (粘性指纹)
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
-        // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
+        // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
             .get_token(
                 &config.request_type,
-                attempt > 0,
+                force_rotate,
                 Some(&session_id),
                 &config.final_model,
             )
@@ -161,13 +162,14 @@ pub async fn handle_generate(
         // [FIX #765] Pass session_id to wrap_request for signature injection
         // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let wrapped_body = wrap_request(
+        let wrapped_body = wrap_request_v2(
             &body,
             &project_id,
             &mapped_model,
             Some(account_id.as_str()),
             Some(&session_id),
             token_obj.as_ref(),
+            Some(&token_manager),
         );
 
         if debug_logger::is_enabled(&debug_cfg) {
@@ -628,8 +630,6 @@ pub async fn handle_generate(
             }
 
             // 判断是否需要轮换账号
-            // 判断是否需要轮换账号
-            let mut force_rotate = false;
             if !should_rotate_account(status_code, Some(&strategy)) {
                 debug!(
                 "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
@@ -639,6 +639,8 @@ pub async fn handle_generate(
             } else {
                 force_rotate = true;
             }
+
+            continue;
         }
 
         // [NEW] 处理 400 错误 (Thinking 签名失效)
