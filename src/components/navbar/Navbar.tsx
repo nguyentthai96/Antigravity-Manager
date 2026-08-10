@@ -1,4 +1,4 @@
-import { LayoutDashboard, Users, Network, Activity, BarChart3, Settings, Lock, KeyRound } from 'lucide-react';
+import { LayoutDashboard, Users, Network, Activity, BarChart3, Settings, Lock, KeyRound, Upload } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
 import { isTauri, isLinux } from '../../utils/env';
@@ -26,6 +26,7 @@ function Navbar() {
         { path: '/monitor', label: t('nav.call_records'), icon: Activity, priority: 'medium' },
         { path: '/token-stats', label: t('nav.token_stats', 'Token 统计'), icon: BarChart3, priority: 'low' },
         { path: '/user-token', label: t('nav.user_token', 'User Tokens'), icon: Users, priority: 'low' },
+        { path: '/bulk-token', label: t('nav.bulk_token', 'Bulk Import'), icon: Upload, priority: 'low' },
         { path: '/security', label: t('nav.security'), icon: Lock, priority: 'low' },
         { path: '/settings', label: t('nav.settings'), icon: Settings, priority: 'high' },
     ];

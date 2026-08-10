@@ -562,6 +562,7 @@ impl AxumServer {
             .route("/accounts/import/db", post(admin_import_from_db))
             .route("/accounts/import/db-custom", post(admin_import_custom_db))
             .route("/accounts/sync/db", post(admin_sync_account_from_db))
+            .route("/bulk-import-tokens", post(admin_bulk_import_tokens))
             .route("/stats/summary", get(admin_get_token_stats_summary))
             .route("/stats/hourly", get(admin_get_token_stats_hourly))
             .route("/stats/daily", get(admin_get_token_stats_daily))
@@ -1983,6 +1984,30 @@ async fn admin_update_user_token(
             )
         })?;
     Ok(StatusCode::OK)
+}
+
+/// Bulk import tokens from a list of {username, refresh_token} entries
+async fn admin_bulk_import_tokens(
+    State(state): State<AppState>,
+    Json(entries): Json<Vec<crate::modules::bulk_token_tool::BulkTokenEntry>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    logger::log_info(&format!(
+        "[API] Bulk import request: {} entries",
+        entries.len()
+    ));
+
+    let response =
+        crate::modules::bulk_token_tool::process_bulk_import(entries, &state.account_service).await;
+
+    // Reload accounts in TokenManager after bulk import
+    if let Err(e) = state.token_manager.load_accounts().await {
+        logger::log_error(&format!(
+            "[API] Failed to reload accounts after bulk import: {}",
+            e
+        ));
+    }
+
+    Ok(Json(response))
 }
 
 async fn admin_should_check_updates() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>

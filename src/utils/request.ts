@@ -156,6 +156,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'renew_user_token': { url: '/api/user-tokens/:id/renew', method: 'POST' },
   'delete_user_token': { url: '/api/user-tokens/:id', method: 'DELETE' },
   'update_user_token': { url: '/api/user-tokens/:id', method: 'PATCH' },
+  // Bulk Import
+  'bulk_import_tokens': { url: '/api/bulk-import-tokens', method: 'POST' },
 
   // Proxy Pool (Web Mode Fix)
   'get_proxy_pool_config': { url: '/api/proxy/pool/config', method: 'GET' },

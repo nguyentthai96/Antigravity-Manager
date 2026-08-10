@@ -1,6 +1,8 @@
 pub mod account;
 pub mod account_service;
+pub mod bulk_token_tool;
 pub mod cache;
+pub mod cli_accounts;
 pub mod cloudflared;
 pub mod config;
 pub mod db;
@@ -16,6 +18,7 @@ pub mod oauth;
 pub mod oauth_server;
 pub mod process;
 pub mod proxy_db;
+pub mod proxy_file_logger;
 pub mod quota;
 pub mod scheduler;
 pub mod security_db;

@@ -119,12 +119,16 @@ impl ProxyMonitor {
             logs.push_front(log.clone());
         }
 
-        // Save to DB
+        // Save to DB + File log
         let log_to_save = log.clone();
         tokio::task::spawn_blocking(move || {
+            // Write to SQLite DB
             if let Err(e) = crate::modules::proxy_db::save_log(&log_to_save) {
                 tracing::error!("Failed to save proxy log to DB: {}", e);
             }
+
+            // Write to JSONL file log
+            crate::modules::proxy_file_logger::write_log_to_file(&log_to_save);
 
             // Sync to Security DB (IpAccessLogs) so it appears in Security Monitor
             if let Some(ip) = &log_to_save.client_ip {

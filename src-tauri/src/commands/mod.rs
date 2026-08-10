@@ -1229,3 +1229,32 @@ pub async fn query_transit_info(url: String, key: String) -> Result<String, Stri
         Err(format!("HTTP {}: {}", status, text))
     }
 }
+
+/// Bulk import tokens from a list of {username, refresh_token} entries
+/// Creates/upserts accounts and generates sk-... API keys for each user
+#[tauri::command]
+pub async fn bulk_import_tokens(
+    app: tauri::AppHandle,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    entries: Vec<crate::modules::bulk_token_tool::BulkTokenEntry>,
+) -> Result<crate::modules::bulk_token_tool::BulkTokenResponse, String> {
+    modules::logger::log_info(&format!(
+        "[BulkImport] Starting bulk import of {} entries",
+        entries.len()
+    ));
+
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app.clone()),
+    );
+
+    let response = modules::bulk_token_tool::process_bulk_import(entries, &service).await;
+
+    // Reload token pool after bulk import
+    let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+
+    // Update tray menus
+    crate::modules::tray::update_tray_menus(&app);
+
+    Ok(response)
+}
+
