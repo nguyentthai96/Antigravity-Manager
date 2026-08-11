@@ -1,7 +1,7 @@
 // 上游客户端实现
 // 基于高性能通讯接口封装
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rquest::{header, Client, Response, StatusCode};
 use serde_json::Value;
 use std::sync::Arc;
@@ -79,6 +79,9 @@ pub struct UpstreamClient {
     proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
     client_cache: DashMap<String, Client>, // proxy_id -> Client
     user_agent_override: RwLock<Option<String>>,
+    /// [PERF] Accounts that triggered 403 with x-goog-user-project header.
+    /// Once blacklisted, we skip the header injection to avoid a wasted ~200ms roundtrip.
+    project_header_blacklist: DashSet<String>,
 }
 
 impl UpstreamClient {
@@ -111,6 +114,7 @@ impl UpstreamClient {
             proxy_pool,
             client_cache: DashMap::new(),
             user_agent_override: RwLock::new(None),
+            project_header_blacklist: DashSet::new(),
         }
     }
 
@@ -376,14 +380,21 @@ impl UpstreamClient {
         // This header belongs to the IDE's JS layer, not the official client's egress.
         // Sending it creates a contradictory "Electron + Node.js" fingerprint.
 
-        // [NEW] 深度解析 body 中的 project_id 并注入 Header
+        // [PERF] 深度解析 body 中的 project_id 并注入 Header
         // 只有当 Body 包含 project 字段且非测试项目时，注入 x-goog-user-project
-        if let Some(proj) = body.get("project").and_then(|v| v.as_str()) {
-            if !proj.is_empty() && proj != "test-project" && proj != "project-id" {
-                if let Ok(hv) = header::HeaderValue::from_str(proj) {
-                    headers.insert("x-goog-user-project", hv);
+        // [OPTIMIZATION] Skip header if this account already triggered 403 (saves ~200ms/req)
+        let account_key = account_id.map(|s| s.to_string()).unwrap_or_default();
+        let skip_project_header = self.project_header_blacklist.contains(&account_key);
+        if !skip_project_header {
+            if let Some(proj) = body.get("project").and_then(|v| v.as_str()) {
+                if !proj.is_empty() && proj != "test-project" && proj != "project-id" {
+                    if let Ok(hv) = header::HeaderValue::from_str(proj) {
+                        headers.insert("x-goog-user-project", hv);
+                    }
                 }
             }
+        } else {
+            tracing::debug!("[PERF] Skipping x-goog-user-project header for account {} (blacklisted)", account_key);
         }
 
         // 注入额外的 Headers (如 anthropic-beta)
@@ -402,6 +413,9 @@ impl UpstreamClient {
 
         // [TEMPORARY FIX #3074] 针对 403 SERVICE_DISABLED 的自动降级重试逻辑
         // 我们包装一层循环，以便在检测到特定错误时移除 Header 并重试
+        // [PERF] Serialize body once outside the loop (was re-serialized on every fallback attempt)
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
         loop {
             let mut last_err: Option<String> = None;
             let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
@@ -411,8 +425,6 @@ impl UpstreamClient {
             for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
                 let url = Self::build_url(base_url, method, query_string);
                 let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
-
-                let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
                 let mut req_builder = client.post(&url).headers(headers.clone());
 
@@ -517,6 +529,14 @@ impl UpstreamClient {
             if should_retry_without_header {
                 headers.remove("x-goog-user-project");
                 has_triggered_downgrade = true;
+                // [PERF] Cache the 403 result so future requests skip the header entirely
+                if !account_key.is_empty() {
+                    self.project_header_blacklist.insert(account_key.clone());
+                    tracing::info!(
+                        "[PERF] Blacklisted x-goog-user-project for account {} (403 detected, future requests will skip header)",
+                        account_key
+                    );
+                }
                 // 重启外层 loop，从第一个端点再次尝试
                 continue;
             }

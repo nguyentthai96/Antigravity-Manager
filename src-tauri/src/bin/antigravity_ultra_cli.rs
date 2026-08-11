@@ -273,7 +273,8 @@ async fn run_start(port: u16, accounts_path: PathBuf, lan: bool, auto_token: boo
             );
             println!("       -H \"Authorization: Bearer <YOUR_TOKEN>\" \\");
             println!("       -H \"Content-Type: application/json\" \\");
-            println!("       -d '{{\"model\":\"claude-sonnet-4-20250514\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'");
+            println!("       -d '{{\"model\":\"gemini-2.5-flash\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'");
+            println!("\n     💡 Also supports: claude-sonnet-4-20250514, claude-sonnet-4-5, claude-opus-4");
             println!("══════════════════════════════════════════════════\n");
 
             // Wait for Ctrl-C
@@ -417,7 +418,8 @@ fn run_info() {
     println!("       -H \"Authorization: Bearer {}\" \\", example_token);
     println!("       -H \"Content-Type: application/json\" \\");
     println!(
-        "       -d '{{\"model\":\"claude-sonnet-4-20250514\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'"
+        "       -d '{{\"model\":\"gemini-2.5-flash\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'"
     );
+    println!("\n     💡 Also supports: claude-sonnet-4-20250514, claude-sonnet-4-5, claude-opus-4");
     println!("══════════════════════════════════════════════════");
 }

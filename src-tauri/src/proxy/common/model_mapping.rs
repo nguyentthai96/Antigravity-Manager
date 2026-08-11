@@ -28,7 +28,9 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("claude-sonnet-4-5", "claude-sonnet-4-6");
     m.insert("claude-sonnet-4-5-thinking", "claude-sonnet-4-6-thinking");
 
-    // 别名映射
+    // 别名映射 (Anthropic SDK versioned IDs)
+    m.insert("claude-sonnet-4-20250514", "claude-sonnet-4-6");
+    m.insert("claude-sonnet-4-5-20250514", "claude-sonnet-4-6");
     m.insert("claude-sonnet-4-5-20250929", "claude-sonnet-4-6-thinking");
     m.insert("claude-3-5-sonnet-20241022", "claude-sonnet-4-6");
     m.insert("claude-3-5-sonnet-20240620", "claude-sonnet-4-6");
@@ -363,6 +365,15 @@ mod tests {
 
     #[test]
     fn test_model_mapping() {
+        // [FIX] claude-sonnet-4-20250514 (used by Anthropic SDK / Claude Code)
+        assert_eq!(
+            map_claude_model_to_gemini("claude-sonnet-4-20250514"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            map_claude_model_to_gemini("claude-sonnet-4-5-20250514"),
+            "claude-sonnet-4-6"
+        );
         assert_eq!(
             map_claude_model_to_gemini("claude-3-5-sonnet-20241022"),
             "claude-sonnet-4-6"
