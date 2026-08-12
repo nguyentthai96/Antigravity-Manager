@@ -438,23 +438,34 @@ impl RateLimitTracker {
 
         // 如果无法从 JSON 解析，尝试从消息文本判断
         let body_lower = body.to_lowercase();
-        // [FIX] 优先判断分钟级限制，避免将 TPM 误判为 Quota
-        let generic_resource_exhausted = body_lower.contains("resource has been exhausted")
-            || body_lower.contains("resource_exhausted");
+        // [FIX #quota-skip] 优先判断分钟级限制
+        // 只有明确包含 "per minute" / "tokens per minute" / "requests per minute" 的才是 TPM/RPM
+        let is_explicit_per_minute = body_lower.contains("per minute")
+            || body_lower.contains("tokens per minute")
+            || body_lower.contains("requests per minute");
         let explicit_quota_exhausted = body_lower.contains("quota_exhausted")
             || body_lower.contains("quotaresetdelay")
             || body_lower.contains("quota reset")
             || body_lower.contains("quota limit")
             || body_lower.contains("per day")
             || body_lower.contains("daily quota");
+        let generic_resource_exhausted = body_lower.contains("resource has been exhausted")
+            || body_lower.contains("resource_exhausted");
 
-        if body_lower.contains("per minute")
-            || body_lower.contains("rate limit")
-            || body_lower.contains("too many requests")
-            || (generic_resource_exhausted && !explicit_quota_exhausted)
-        {
+        if is_explicit_per_minute {
+            // 明确是 TPM/RPM burst limit
             RateLimitReason::RateLimitExceeded
-        } else if body_lower.contains("exhausted") || body_lower.contains("quota") {
+        } else if body_lower.contains("rate limit") || body_lower.contains("too many requests") {
+            RateLimitReason::RateLimitExceeded
+        } else if explicit_quota_exhausted
+            || generic_resource_exhausted
+            || body_lower.contains("exhausted")
+            || body_lower.contains("quota")
+        {
+            // [FIX #quota-skip] Generic RESOURCE_EXHAUSTED 现在归类为 QuotaExhausted
+            // 而不是之前的 RateLimitExceeded (30s lockout)。
+            // Google 返回的 generic RESOURCE_EXHAUSTED 通常是 daily/hourly quota，
+            // 需要更长的 lockout 来避免反复 429。
             RateLimitReason::QuotaExhausted
         } else {
             RateLimitReason::Unknown
@@ -676,6 +687,58 @@ impl RateLimitTracker {
             count
         );
     }
+
+    /// [FIX #quota-skip] 清除非 QuotaExhausted 的限流记录
+    ///
+    /// 用于智能乐观重置: 只清除短期限流 (RateLimitExceeded, ServerError 等),
+    /// 保留 QuotaExhausted 条目, 因为 quota 需要实际时间来重置,
+    /// 清除它们只会导致重新 hit 429 的死循环。
+    pub fn clear_non_quota(&self) {
+        let now = std::time::SystemTime::now();
+        let mut cleared = 0u32;
+        let mut kept = 0u32;
+        self.limits.retain(|_key, info| {
+            // 保留未过期的 QuotaExhausted 条目
+            if matches!(info.reason, RateLimitReason::QuotaExhausted) && info.reset_time > now {
+                kept += 1;
+                true
+            } else if info.reset_time <= now {
+                // 已过期的一律清除
+                cleared += 1;
+                false
+            } else {
+                // 非 QuotaExhausted 的未过期条目也清除 (乐观重置)
+                cleared += 1;
+                false
+            }
+        });
+        tracing::warn!(
+            "🔄 Smart optimistic reset: Cleared {} non-quota record(s), kept {} QuotaExhausted record(s)",
+            cleared,
+            kept
+        );
+    }
+
+    /// [FIX #quota-skip] 检查账号的特定模型是否处于 QuotaExhausted 状态
+    ///
+    /// 用于 proactive pre-flight check: 在选择账号前就跳过
+    /// 已知 quota exhausted 的账号, 避免浪费 retry attempts。
+    pub fn is_quota_exhausted(&self, account_id: &str, model: &str) -> bool {
+        let now = std::time::SystemTime::now();
+        let key = self.get_limit_key(account_id, Some(model));
+        if let Some(info) = self.limits.get(&key) {
+            if matches!(info.reason, RateLimitReason::QuotaExhausted) && info.reset_time > now {
+                return true;
+            }
+        }
+        // 也检查账号级 QuotaExhausted
+        if let Some(info) = self.limits.get(account_id) {
+            if matches!(info.reason, RateLimitReason::QuotaExhausted) && info.reset_time > now {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl Default for RateLimitTracker {
@@ -751,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_resource_exhausted_is_short_rate_limit() {
+    fn test_generic_resource_exhausted_is_quota_exhausted() {
         let tracker = RateLimitTracker::new();
         let body = r#"{
             "error": {
@@ -761,7 +824,9 @@ mod tests {
             }
         }"#;
         let reason = tracker.parse_rate_limit_reason(body);
-        assert_eq!(reason, RateLimitReason::RateLimitExceeded);
+        // [FIX #quota-skip] Generic RESOURCE_EXHAUSTED without explicit "per minute"
+        // is now classified as QuotaExhausted for longer lockout
+        assert_eq!(reason, RateLimitReason::QuotaExhausted);
     }
 
     #[test]
@@ -812,12 +877,12 @@ mod tests {
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
         assert_eq!(info.unwrap().retry_after_sec, 300);
 
-        // 第 3 次 429 → 1800 秒
+        // 第 3 次 429 → 1800 秒 but capped to 300 by safety cap
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 1800);
+        assert_eq!(info.unwrap().retry_after_sec, 300);
 
-        // 第 4 次 429 → 7200 秒
+        // 第 4 次 429 → 7200 秒 but capped to 300 by safety cap
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 7200);
+        assert_eq!(info.unwrap().retry_after_sec, 300);
     }
 }

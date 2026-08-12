@@ -1265,6 +1265,72 @@ impl TokenManager {
             return Err("Token pool is empty".to_string());
         }
 
+        // [FIX #quota-skip] Pre-flight Quota Exhaustion Check
+        // 1. 过滤掉 quota = 0% 的账号（已确认 exhausted，无需尝试）
+        let before_quota_filter = tokens_snapshot.len();
+        tokens_snapshot.retain(|t| {
+            let quota = t.model_quotas.get(&normalized_target).copied().unwrap_or(0);
+            if quota == 0 {
+                tracing::debug!(
+                    "⏭️ [Quota-Skip] Skipping account {} for model {} (quota=0%)",
+                    t.email, normalized_target
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if before_quota_filter > tokens_snapshot.len() {
+            tracing::info!(
+                "⏭️ [Quota-Skip] Pre-filtered {}/{} accounts with 0% quota for model {}",
+                before_quota_filter - tokens_snapshot.len(),
+                before_quota_filter,
+                normalized_target
+            );
+        }
+
+        // 2. 过滤掉已被 rate_limit_tracker 标记为 QuotaExhausted 的账号
+        let before_exhausted_filter = tokens_snapshot.len();
+        tokens_snapshot.retain(|t| {
+            if self.rate_limit_tracker.is_quota_exhausted(&t.account_id, &normalized_target) {
+                let wait = self.rate_limit_tracker.get_remaining_wait(&t.account_id, Some(&normalized_target));
+                tracing::debug!(
+                    "⏭️ [Quota-Skip] Skipping account {} for model {} (QuotaExhausted, {}s remaining)",
+                    t.email, normalized_target, wait
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if before_exhausted_filter > tokens_snapshot.len() {
+            tracing::info!(
+                "⏭️ [Quota-Skip] Pre-filtered {}/{} accounts with active QuotaExhausted lockout for model {}",
+                before_exhausted_filter - tokens_snapshot.len(),
+                before_exhausted_filter,
+                normalized_target
+            );
+        }
+
+        // 如果所有账号都被 pre-flight 过滤掉了，回退到原始集合（让常规 retry 逻辑处理）
+        if tokens_snapshot.is_empty() && before_quota_filter > 0 {
+            tracing::warn!(
+                "⚠️ [Quota-Skip] All {} accounts exhausted for model {}, falling back to full pool for retry",
+                before_quota_filter, normalized_target
+            );
+            // 重新加载（不含 quota=0% 过滤，但保留 model_quotas 过滤）
+            tokens_snapshot = self.tokens.iter().map(|e| e.value().clone()).collect();
+            tokens_snapshot.retain(|t| t.model_quotas.contains_key(&normalized_target));
+            if tokens_snapshot.is_empty() {
+                return Err(format!(
+                    "All accounts quota exhausted for model: {}",
+                    normalized_target
+                ));
+            }
+        }
+
+        total = tokens_snapshot.len();
+
         tokens_snapshot.sort_by(|a, b| {
             // Priority 0: 严格的订阅等级排序 (ULTRA > PRO > FREE)
             // 用户要求：轮询应当遵循 Ultra -> Pro -> Free
@@ -1781,8 +1847,10 @@ impl TokenManager {
                                     tokens_snapshot.len()
                                 );
 
-                                // 清除所有限流记录
-                                self.rate_limit_tracker.clear_all();
+                                // [FIX #quota-skip] 使用智能重置：保留 QuotaExhausted 记录
+                                // 清除 RateLimitExceeded/ServerError 等短期限流，
+                                // 但保留 QuotaExhausted 因为 quota 需要实际时间来恢复
+                                self.rate_limit_tracker.clear_non_quota();
 
                                 // 再次尝试选择账号
                                 let final_token = tokens_snapshot.iter().find(|t| {
@@ -2623,27 +2691,34 @@ impl TokenManager {
 
         // 确定限流原因
         let error_body_lower = error_body.to_lowercase();
-        let generic_resource_exhausted = error_body_lower.contains("resource has been exhausted")
-            || error_body_lower.contains("resource_exhausted");
+        // [FIX #quota-skip] 只有明确包含 "per minute" 的才是 TPM/RPM
+        let is_explicit_per_minute = error_body_lower.contains("per minute")
+            || error_body_lower.contains("tokens per minute")
+            || error_body_lower.contains("requests per minute");
         let explicit_quota_exhausted = error_body_lower.contains("quota_exhausted")
             || error_body_lower.contains("quotaresetdelay")
             || error_body_lower.contains("quota reset")
             || error_body_lower.contains("quota limit")
             || error_body_lower.contains("per day")
             || error_body_lower.contains("daily quota");
+        let generic_resource_exhausted = error_body_lower.contains("resource has been exhausted")
+            || error_body_lower.contains("resource_exhausted");
 
         let reason = if error_body_lower.contains("model_capacity") {
             crate::proxy::rate_limit::RateLimitReason::ModelCapacityExhausted
-        } else if error_body_lower.contains("per minute")
-            || error_body_lower.contains("rate limit")
+        } else if is_explicit_per_minute {
+            // 明确是 TPM/RPM burst limit
+            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded
+        } else if error_body_lower.contains("rate limit")
             || error_body_lower.contains("too many requests")
-            || (generic_resource_exhausted && !explicit_quota_exhausted)
         {
             crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded
         } else if explicit_quota_exhausted
+            || generic_resource_exhausted
             || error_body_lower.contains("exhausted")
             || error_body_lower.contains("quota")
         {
+            // [FIX #quota-skip] Generic RESOURCE_EXHAUSTED → QuotaExhausted (lockout 60s+)
             crate::proxy::rate_limit::RateLimitReason::QuotaExhausted
         } else {
             crate::proxy::rate_limit::RateLimitReason::Unknown
