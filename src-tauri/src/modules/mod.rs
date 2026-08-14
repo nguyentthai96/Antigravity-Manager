@@ -20,6 +20,7 @@ pub mod process;
 pub mod proxy_db;
 pub mod proxy_file_logger;
 pub mod quota;
+pub mod quota_health_monitor;
 pub mod scheduler;
 pub mod security_db;
 pub mod token_stats;

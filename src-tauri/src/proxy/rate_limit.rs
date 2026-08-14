@@ -693,6 +693,56 @@ impl RateLimitTracker {
     /// 用于智能乐观重置: 只清除短期限流 (RateLimitExceeded, ServerError 等),
     /// 保留 QuotaExhausted 条目, 因为 quota 需要实际时间来重置,
     /// 清除它们只会导致重新 hit 429 的死循环。
+
+    /// [NEW] Get all account IDs that have active QuotaExhausted entries
+    /// Used by the QuotaHealthMonitor to identify accounts needing recovery checks
+    pub fn get_quota_exhausted_account_ids(&self) -> Vec<String> {
+        let now = std::time::SystemTime::now();
+        let mut account_ids = std::collections::HashSet::new();
+
+        for entry in self.limits.iter() {
+            let info = entry.value();
+            if matches!(info.reason, RateLimitReason::QuotaExhausted) && info.reset_time > now {
+                // Extract account_id from the key (format: "account_id" or "account_id::model")
+                let key = entry.key();
+                let account_id = if let Some(pos) = key.find("::") {
+                    &key[..pos]
+                } else {
+                    key.as_str()
+                };
+                account_ids.insert(account_id.to_string());
+            }
+        }
+
+        account_ids.into_iter().collect()
+    }
+
+    /// [NEW] Clear QuotaExhausted entries for a specific account
+    /// Called when health monitor confirms quota has recovered
+    pub fn clear_quota_exhausted_for_account(&self, account_id: &str) {
+        let mut cleared = 0u32;
+        self.limits.retain(|key, info| {
+            let is_this_account = key == account_id || key.starts_with(&format!("{}::", account_id));
+            if is_this_account && matches!(info.reason, RateLimitReason::QuotaExhausted) {
+                cleared += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if cleared > 0 {
+            // Also reset failure counts for this account
+            self.failure_counts.retain(|key, _| {
+                !(key == account_id || key.starts_with(&format!("{}::", account_id)))
+            });
+            tracing::info!(
+                "🏥 [QuotaHealthMonitor] Cleared {} QuotaExhausted record(s) for account {}",
+                cleared,
+                account_id
+            );
+        }
+    }
+
     pub fn clear_non_quota(&self) {
         let now = std::time::SystemTime::now();
         let mut cleared = 0u32;

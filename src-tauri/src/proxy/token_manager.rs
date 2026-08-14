@@ -62,6 +62,9 @@ pub struct TokenManager {
     /// 支持优雅关闭时主动 abort 后台任务
     auto_cleanup_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     cancel_token: CancellationToken,
+
+    /// [NEW] Signal to wake up the QuotaHealthMonitor when all accounts are exhausted
+    health_check_notify: Arc<tokio::sync::Notify>,
 }
 
 impl TokenManager {
@@ -84,6 +87,7 @@ impl TokenManager {
             load_code_assist_inflight: Arc::new(DashMap::new()), // 初始化 inflight 表
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
+            health_check_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -122,6 +126,21 @@ impl TokenManager {
         *guard = Some(handle);
 
         tracing::info!("Rate limit auto-cleanup task started (interval: 15s)");
+    }
+
+    /// [NEW] Get the health check notify signal for the QuotaHealthMonitor
+    pub fn get_health_check_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.health_check_notify.clone()
+    }
+
+    /// [NEW] Get the data directory path
+    pub fn get_data_dir(&self) -> &PathBuf {
+        &self.data_dir
+    }
+
+    /// [NEW] Get the rate limit tracker
+    pub fn get_rate_limit_tracker(&self) -> Arc<RateLimitTracker> {
+        self.rate_limit_tracker.clone()
     }
 
     /// 从主应用账号目录加载所有账号
@@ -1866,15 +1885,21 @@ impl TokenManager {
                                     );
                                     t.clone()
                                 } else {
+                                    // [NEW] Signal health monitor to check for quota recovery
+                                    self.health_check_notify.notify_one();
                                     return Err(
                                         "All accounts failed after optimistic reset.".to_string()
                                     );
                                 }
                             }
                         } else {
+                            // [NEW] Signal health monitor to check for quota recovery
+                            self.health_check_notify.notify_one();
                             return Err(format!("All accounts limited. Wait {}s.", wait_sec));
                         }
                     } else {
+                        // [NEW] Signal health monitor to check for quota recovery
+                        self.health_check_notify.notify_one();
                         return Err("All accounts failed or unhealthy.".to_string());
                     }
                 }
@@ -2358,6 +2383,28 @@ impl TokenManager {
     #[allow(dead_code)]
     pub fn get_rate_limit_reset_seconds(&self, account_id: &str) -> Option<u64> {
         self.rate_limit_tracker.get_reset_seconds(account_id)
+    }
+
+    /// Get health status for all accounts (for /health/accounts endpoint).
+    ///
+    /// Returns a vector of (account_id, email, is_rate_limited, remaining_wait_seconds)
+    /// Used by the health endpoint to report quota status without exposing private fields.
+    pub fn get_accounts_health_status(&self) -> Vec<(String, String, bool, u64)> {
+        self.tokens
+            .iter()
+            .map(|entry| {
+                let token = entry.value();
+                let remaining_wait = self
+                    .rate_limit_tracker
+                    .get_remaining_wait(&token.account_id, None);
+                (
+                    token.account_id.clone(),
+                    token.email.clone(),
+                    remaining_wait > 0,
+                    remaining_wait,
+                )
+            })
+            .collect()
     }
 
     /// 清除过期的限流记录

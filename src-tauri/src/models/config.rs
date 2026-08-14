@@ -2,6 +2,7 @@ use crate::modules::cloudflared::CloudflaredConfig;
 use crate::proxy::ProxyConfig;
 use serde::{Deserialize, Serialize};
 
+
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -32,6 +33,8 @@ pub struct AppConfig {
     pub hidden_menu_items: Vec<String>, // Hidden menu item path list
     #[serde(default)]
     pub cloudflared: CloudflaredConfig, // [NEW] Cloudflared configuration
+    #[serde(default)]
+    pub quota_health_check: QuotaHealthCheckConfig, // [NEW] Autonomous quota health check configuration
 }
 
 /// Scheduled warmup configuration
@@ -192,7 +195,43 @@ impl AppConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             hidden_menu_items: Vec::new(),
             cloudflared: CloudflaredConfig::default(),
+            quota_health_check: QuotaHealthCheckConfig::default(),
         }
+    }
+}
+
+/// Autonomous quota health check configuration
+/// When enabled, the proxy will periodically check quota status of ALL accounts
+/// and re-activate accounts whose quota has recovered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaHealthCheckConfig {
+    /// Whether autonomous health check is enabled
+    pub enabled: bool,
+    /// Health check interval in seconds (default: 600 = 10 minutes)
+    pub interval_seconds: u64,
+    /// Whether to use smart sleeping (sleep until reset_time when all accounts exhausted)
+    pub smart_sleep_enabled: bool,
+    /// Buffer seconds to add after reset_time before checking (default: 30)
+    pub reset_buffer_seconds: u64,
+    /// Maximum sleep duration in seconds (cap, default: 3600 = 1 hour)
+    pub max_sleep_seconds: u64,
+}
+
+impl QuotaHealthCheckConfig {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 600,     // 10 minutes
+            smart_sleep_enabled: true,
+            reset_buffer_seconds: 30,
+            max_sleep_seconds: 3600,   // 1 hour cap
+        }
+    }
+}
+
+impl Default for QuotaHealthCheckConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

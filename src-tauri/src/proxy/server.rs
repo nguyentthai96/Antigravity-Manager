@@ -430,6 +430,7 @@ impl AxumServer {
         let proxy_routes = Router::new()
             .route("/health", get(health_check_handler))
             .route("/healthz", get(health_check_handler))
+            .route("/health/accounts", get(health_accounts_handler))
             // OpenAI Protocol
             .route("/v1/models", get(handlers::openai::handle_list_models))
             .route(
@@ -901,6 +902,84 @@ async fn health_check_handler() -> Response {
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION")
+    }))
+    .into_response()
+}
+
+/// 账号配额健康检查处理器
+///
+/// Returns per-account rate-limit status with aggregate recovery info.
+/// Used by pipeline clients (Hermes) to poll for account recovery
+/// instead of blind exponential backoff.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "any_available": true,
+///   "total_accounts": 5,
+///   "limited_accounts": 3,
+///   "earliest_recovery_seconds": 42,
+///   "accounts": [
+///     { "account_id": "...", "email_hint": "j***@gmail.com",
+///       "rate_limited": true, "remaining_wait_seconds": 42 },
+///     ...
+///   ]
+/// }
+/// ```
+async fn health_accounts_handler(
+    State(state): State<AppState>,
+) -> Response {
+    let statuses = state.token_manager.get_accounts_health_status();
+
+    let mut earliest_recovery_secs: Option<u64> = None;
+    let mut any_available = false;
+    let mut limited_count = 0u32;
+    let mut accounts_json = Vec::new();
+
+    for (account_id, email, is_limited, remaining_wait) in &statuses {
+        if *is_limited {
+            limited_count += 1;
+            if let Some(ref mut earliest) = earliest_recovery_secs {
+                if *remaining_wait < *earliest {
+                    *earliest = *remaining_wait;
+                }
+            } else {
+                earliest_recovery_secs = Some(*remaining_wait);
+            }
+        } else {
+            any_available = true;
+        }
+
+        // Redact email for security (public endpoint)
+        let email_hint = if email.len() > 4 {
+            let at_pos = email.find('@').unwrap_or(email.len());
+            if at_pos > 2 {
+                format!(
+                    "{}***{}",
+                    &email[..1],
+                    &email[at_pos.saturating_sub(1)..]
+                )
+            } else {
+                "***".to_string()
+            }
+        } else {
+            "***".to_string()
+        };
+
+        accounts_json.push(serde_json::json!({
+            "account_id": account_id,
+            "email_hint": email_hint,
+            "rate_limited": is_limited,
+            "remaining_wait_seconds": remaining_wait,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "any_available": any_available,
+        "total_accounts": accounts_json.len(),
+        "limited_accounts": limited_count,
+        "earliest_recovery_seconds": earliest_recovery_secs,
+        "accounts": accounts_json,
     }))
     .into_response()
 }

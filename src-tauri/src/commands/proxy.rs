@@ -38,6 +38,9 @@ pub struct ProxyServiceInstance {
     pub axum_server: crate::proxy::AxumServer,
     #[allow(dead_code)] // 保留句柄以便未来支持显式停服/诊断
     pub server_handle: tokio::task::JoinHandle<()>,
+    // [NEW] Quota Health Monitor lifecycle handles
+    pub health_monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    pub health_monitor_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ProxyServiceState {
@@ -155,6 +158,21 @@ pub async fn internal_start_proxy_service(
         .update_circuit_breaker_config(app_config.circuit_breaker)
         .await;
 
+    // [NEW] Start the Quota Health Monitor background task
+    let (health_monitor_handle, health_monitor_cancel) = if app_config.quota_health_check.enabled {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = crate::modules::quota_health_monitor::start_health_monitor(
+            token_manager.clone(),
+            app_config.quota_health_check.clone(),
+            cancel.clone(),
+        );
+        tracing::info!("🏥 [Proxy] Quota Health Monitor started (interval={}s)", app_config.quota_health_check.interval_seconds);
+        (Some(handle), Some(cancel))
+    } else {
+        tracing::info!("🏥 [Proxy] Quota Health Monitor is disabled by configuration");
+        (None, None)
+    };
+
     // 🆕 [FIX #820] 恢复固定账号模式设置
     if let Some(ref account_id) = config.preferred_account_id {
         token_manager
@@ -171,6 +189,10 @@ pub async fn internal_start_proxy_service(
             && !matches!(config.zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
         if !zai_enabled {
             tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
+            // Cancel health monitor if no accounts
+            if let Some(cancel) = &health_monitor_cancel {
+                cancel.cancel();
+            }
             return Ok(ProxyStatus {
                 running: false,
                 port: config.port,
@@ -190,6 +212,8 @@ pub async fn internal_start_proxy_service(
         token_manager: token_manager.clone(),
         axum_server: axum_server.clone(),
         server_handle: tokio::spawn(async {}), // 逻辑上的 handle
+        health_monitor_handle,
+        health_monitor_cancel,
     };
 
     // [FIX] Ensure the server is logically running
@@ -294,6 +318,16 @@ pub async fn stop_proxy_service(state: State<'_, ProxyServiceState>) -> Result<(
 
     // 停止 Axum 服务器 (仅逻辑停止，不杀死进程)
     if let Some(instance) = instance_lock.take() {
+        // [NEW] Cancel and abort the Quota Health Monitor
+        if let Some(cancel) = &instance.health_monitor_cancel {
+            cancel.cancel();
+            tracing::info!("🏥 [Proxy] Quota Health Monitor cancel signal sent");
+        }
+        if let Some(handle) = instance.health_monitor_handle {
+            handle.abort();
+            tracing::info!("🏥 [Proxy] Quota Health Monitor task aborted");
+        }
+
         instance.token_manager.abort_background_tasks().await;
         instance.axum_server.set_running(false).await;
         // 已移除 instance.axum_server.stop() 调用，防止杀死 Admin Server
