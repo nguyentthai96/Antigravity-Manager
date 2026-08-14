@@ -1,0 +1,80 @@
+[package]
+name = "antigravity-ultra"
+version = "1.0.0"
+edition = "2021"
+description = "Standalone headless proxy for Antigravity — zero Tauri dependencies"
+authors = ["Antigravity Team"]
+
+[[bin]]
+name = "antigravity-ultra"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP Server
+axum = { version = "0.7", features = ["multipart", "ws", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# HTTP Client (replaces rquest — no TLS fingerprint spoofing needed for headless)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Database (User Token management)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Utils
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
+anyhow = "1.0"
+thiserror = "2"
+futures = "0.3"
+rand = "0.8"
+dashmap = "6.1"
+bytes = "1.5"
+async-stream = "0.3"
+once_cell = "1.19"
+regex = "1"
+base64 = "0.22"
+sha2 = "0.10"
+url = "2.5"
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+parking_lot = "0.12"
+http = "1"
+http-body-util = "0.1"
+pin-project-lite = "0.2"
+mime = "0.3"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-Time Optimization
+codegen-units = 1   # Single codegen unit for better optimization
+strip = true        # Strip symbols
+panic = "abort"     # Abort on panic (smaller binary)
+
+
+# cd antigravity-ultra
+# Build
+#cargo build
+# Start proxy with your accounts
+# ./target/debug/antigravity-ultra start \
+#   --accounts ../antigravity-cli/antigravity_accounts.json \
+#   --port 8045 \
+#   --auto-token
+# Or just test accounts
+# ./target/debug/antigravity-ultra accounts healthcheck \
+#   --accounts ../antigravity-cli/antigravity_accounts.json

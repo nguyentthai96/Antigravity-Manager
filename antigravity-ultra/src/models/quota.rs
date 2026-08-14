@@ -1,0 +1,89 @@
+use serde::{Deserialize, Serialize};
+
+/// Single quota bucket (from retrieveUserQuotaSummary)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaBucket {
+    pub bucket_id: String,
+    pub window: String,
+    pub remaining_fraction: f64,
+    pub reset_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Model group (e.g. Gemini Models / Claude and GPT models)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaGroup {
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub buckets: Vec<QuotaBucket>,
+}
+
+/// Model quota information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelQuota {
+    pub name: String,
+    pub percentage: i32,
+    pub reset_time: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_mime_types: Option<std::collections::HashMap<String, bool>>,
+}
+
+/// Quota data structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaData {
+    pub models: Vec<ModelQuota>,
+    pub last_updated: i64,
+    #[serde(default)]
+    pub is_forbidden: bool,
+    #[serde(default)]
+    pub forbidden_reason: Option<String>,
+    #[serde(default)]
+    pub subscription_tier: Option<String>,
+    #[serde(default)]
+    pub model_forwarding_rules: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub quota_groups: Option<Vec<QuotaGroup>>,
+}
+
+impl QuotaData {
+    pub fn new() -> Self {
+        Self {
+            models: Vec::new(),
+            last_updated: chrono::Utc::now().timestamp(),
+            is_forbidden: false,
+            forbidden_reason: None,
+            subscription_tier: None,
+            model_forwarding_rules: std::collections::HashMap::new(),
+            quota_groups: None,
+        }
+    }
+
+    pub fn add_model(&mut self, model: ModelQuota) {
+        self.models.push(model);
+    }
+}
+
+impl Default for QuotaData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
