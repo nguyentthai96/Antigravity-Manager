@@ -109,10 +109,16 @@ pub fn create_token(
     curfew_start: Option<String>,
     curfew_end: Option<String>,
     custom_expires_at: Option<i64>,
+    custom_token: Option<String>,
 ) -> Result<UserToken, String> {
     let conn = connect_db()?;
     let id = Uuid::new_v4().to_string();
-    let token = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+    let token = match custom_token {
+        Some(t) if !t.is_empty() => {
+            if t.starts_with("sk-") { t } else { format!("sk-{}", t) }
+        }
+        _ => format!("sk-{}", Uuid::new_v4().to_string().replace('-', "")),
+    };
     let now = Utc::now().timestamp();
 
     let expires_at = match expires_type.as_str() {

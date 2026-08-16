@@ -24,6 +24,7 @@ impl TokenManager {
             match crate::oauth::refresh_access_token(&entry.refresh_token, Some(&account.id)).await
             {
                 Ok(token_resp) => {
+                    let access_token_for_quota = token_resp.access_token.clone();
                     account.token = TokenData::new(
                         token_resp.access_token,
                         entry.refresh_token.clone(),
@@ -39,6 +40,25 @@ impl TokenManager {
                         entry.email,
                         token_resp.expires_in
                     );
+
+                    // Fetch quota & project_id at startup so proxy routing works immediately
+                    match crate::quota::fetch_quota(&access_token_for_quota, &entry.email, None).await {
+                        Ok((quota_data, project_id)) => {
+                            if let Some(ref pid) = project_id {
+                                account.token.project_id = Some(pid.clone());
+                                tracing::info!("   📋 [{}] Project ID: {}", entry.email, pid);
+                            }
+                            if !quota_data.is_forbidden {
+                                account.update_quota(quota_data);
+                            } else {
+                                tracing::warn!("   ⚠️ [{}] Quota: FORBIDDEN (403)", entry.email);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("   ⚠️ [{}] Quota fetch failed: {}", entry.email, e);
+                        }
+                    }
+
                     accounts.push(account);
                 }
                 Err(e) => {

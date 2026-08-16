@@ -42,6 +42,10 @@ enum Commands {
         #[arg(long)]
         auto_token: bool,
 
+        /// Specify a fixed API key (e.g. sk-mykey123). Used with --auto-token.
+        #[arg(long)]
+        api_key: Option<String>,
+
         /// Enable auto-refresh for expired tokens
         #[arg(long, default_value = "true")]
         auto_refresh: bool,
@@ -129,10 +133,11 @@ async fn main() -> anyhow::Result<()> {
             accounts,
             lan,
             auto_token,
+            api_key,
             auto_refresh,
             healthcheck_interval,
         } => {
-            cmd_start(port, accounts, lan, auto_token, auto_refresh, healthcheck_interval).await?;
+            cmd_start(port, accounts, lan, auto_token, api_key, auto_refresh, healthcheck_interval).await?;
         }
         Commands::Token { action } => match action {
             TokenAction::Create {
@@ -174,6 +179,7 @@ async fn cmd_start(
     accounts_path: Option<PathBuf>,
     lan: bool,
     auto_token: bool,
+    api_key: Option<String>,
     auto_refresh: bool,
     healthcheck_interval: u64,
 ) -> anyhow::Result<()> {
@@ -226,6 +232,7 @@ async fn cmd_start(
                 None,
                 None,
                 None,
+                api_key.clone(),
             ) {
                 Ok(token) => {
                     tracing::info!("🔑 Auto-generated API key: {}", token.token);
@@ -233,6 +240,13 @@ async fn cmd_start(
                 Err(e) => {
                     tracing::warn!("Failed to auto-generate token: {}", e);
                 }
+            }
+        } else if let Some(ref key) = api_key {
+            // Check if the desired key already exists
+            let key_exists = tokens.iter().any(|t| t.token == *key);
+            if !key_exists {
+                tracing::info!("🔑 Existing tokens found but not matching --api-key, keeping existing tokens.");
+                tracing::info!("   Current key: {}", tokens[0].token);
             }
         }
     }
@@ -261,6 +275,7 @@ fn cmd_token_create(
         expires.to_string(),
         description.map(String::from),
         0,
+        None,
         None,
         None,
         None,
