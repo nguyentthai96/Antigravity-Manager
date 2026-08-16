@@ -1,0 +1,967 @@
+//! Anthropic ↔ Gemini protocol bridge.
+//!
+//! Transforms Anthropic Messages API requests to Gemini v1internal format,
+//! and Gemini SSE responses back to Anthropic SSE format.
+
+use bytes::Bytes;
+use futures::stream::{self, Stream, StreamExt};
+use serde_json::{json, Value};
+use std::pin::Pin;
+
+// ──────────────────────────────────────────────────────────────
+// Request detection
+// ──────────────────────────────────────────────────────────────
+
+/// Detect if the incoming request body is in Anthropic Messages API format.
+///
+/// Heuristics:
+///   - Has top-level "system" field (string or array) — Anthropic puts system at top level
+///   - Has "tools" with "input_schema" — Anthropic tool format
+///   - Does NOT have "messages[].content" as string only — Anthropic supports array content blocks
+pub fn is_anthropic_format(body: &Value, headers: &axum::http::HeaderMap) -> bool {
+    // Check headers first (fastest)
+
+    // Standard Anthropic SDK header
+    if headers.get("anthropic-version").is_some() {
+        return true;
+    }
+
+    // Anthropic SDK sends x-api-key instead of Authorization: Bearer
+    if headers.get("x-api-key").is_some() && !headers.contains_key("authorization") {
+        return true;
+    }
+
+    // Stainless SDK headers
+    if headers.get("x-stainless-stream-helper").is_some() {
+        return true;
+    }
+    if headers.get("x-stainless-helper-method").is_some() {
+        return true;
+    }
+
+    // Check body structure
+    // Anthropic has top-level "system" (not inside messages)
+    if body.get("system").is_some() {
+        return true;
+    }
+
+    // Anthropic uses "max_tokens" at top level (required field)
+    // combined with "messages" but no "response_format" (OpenAI-specific)
+    if body.get("max_tokens").is_some()
+        && body.get("messages").is_some()
+        && body.get("response_format").is_none()
+    {
+        // Additional check: Anthropic message content is array of blocks or string
+        // while OpenAI message content is always string
+        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+            if let Some(first) = msgs.first() {
+                // Anthropic uses "content" as array of blocks
+                if first.get("content").and_then(|c| c.as_array()).is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Anthropic tools use "input_schema", OpenAI uses "parameters"
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        if let Some(first) = tools.first() {
+            if first.get("input_schema").is_some() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Detect if the request wants streaming.
+///
+/// Anthropic SDK uses `client.messages.stream()` which:
+///   - Sets `x-stainless-stream-helper: messages` header
+///   - Sets `"stream": true` in body
+///
+/// We check both body field and headers.
+pub fn detect_stream(body: &Value, headers: &axum::http::HeaderMap) -> bool {
+    // Check body "stream" field
+    if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
+        return stream;
+    }
+
+    // Check Anthropic SDK streaming headers
+    if headers.get("x-stainless-stream-helper").is_some() {
+        return true;
+    }
+
+    false
+}
+
+// ──────────────────────────────────────────────────────────────
+// Request transformation: Anthropic → Gemini v1internal
+// ──────────────────────────────────────────────────────────────
+
+/// Transform an Anthropic Messages API request body into Gemini v1internal format.
+pub fn transform_anthropic_to_gemini(
+    body: &Value,
+    model: &str,
+    account: &crate::models::Account,
+) -> Value {
+    let project_id = account.token.project_id.as_deref().unwrap_or("");
+
+    // 1. Convert messages to Gemini contents
+    let mut contents: Vec<Value> = Vec::new();
+
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let gemini_role = match role {
+                "assistant" => "model",
+                _ => "user",
+            };
+
+            let parts = extract_parts_from_anthropic_message(msg);
+            if !parts.is_empty() {
+                contents.push(json!({
+                    "role": gemini_role,
+                    "parts": parts
+                }));
+            }
+        }
+    }
+
+    // 2. Extract system instruction (Anthropic puts it at top level)
+    let system_instruction = extract_system_instruction(body);
+
+    // 3. Build generation config
+    let mut generation_config = json!({});
+    if let Some(max_tokens) = body.get("max_tokens") {
+        generation_config["maxOutputTokens"] = max_tokens.clone();
+    }
+    if let Some(temp) = body.get("temperature") {
+        generation_config["temperature"] = temp.clone();
+    }
+    if let Some(top_p) = body.get("top_p") {
+        generation_config["topP"] = top_p.clone();
+    }
+
+    // Handle thinking config (Anthropic thinking models)
+    if let Some(thinking) = body.get("thinking") {
+        if let Some(budget) = thinking.get("budget_tokens").and_then(|b| b.as_i64()) {
+            generation_config["thinkingConfig"] = json!({
+                "thinkingBudget": budget
+            });
+        }
+    }
+
+    // 4. Convert Anthropic tools to Gemini function declarations
+    let tools_declarations = convert_anthropic_tools(body);
+
+    // 5. Session ID
+    let session_id = format!("{:x}", {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in account.id.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    });
+
+    // 6. Build inner request with stable field ordering (matches Tauri source)
+    // Order: systemInstruction → tools → toolConfig → generationConfig → safetySettings → sessionId → contents
+    let mut inner_request = serde_json::Map::new();
+
+    // systemInstruction first (most stable, benefits prefix caching)
+    if let Some(system) = system_instruction {
+        inner_request.insert("systemInstruction".to_string(), system);
+    }
+
+    // tools
+    if let Some(tools) = tools_declarations {
+        inner_request.insert("tools".to_string(), tools);
+        // Inject toolConfig when tools are present (match Tauri: VALIDATED mode)
+        inner_request.insert("toolConfig".to_string(), json!({
+            "functionCallingConfig": { "mode": "VALIDATED" }
+        }));
+    }
+
+    // generationConfig
+    inner_request.insert("generationConfig".to_string(), generation_config);
+
+    // safetySettings
+    inner_request.insert("safetySettings".to_string(), json!([
+        { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
+        { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
+        { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
+        { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
+    ]));
+
+    // sessionId
+    inner_request.insert("sessionId".to_string(), json!(session_id));
+
+    // contents last (dynamic, changes every turn)
+    inner_request.insert("contents".to_string(), json!(contents));
+
+    // 7. Build official requestId format: agent/{timestamp_ms}/{random_hex_8bytes}
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let random_hex = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let official_request_id = format!("agent/{}/{}", timestamp_ms, random_hex);
+
+    // Determine userAgent based on account type
+    let is_enterprise = !account.email.ends_with("@gmail.com") && !account.email.ends_with("@googlemail.com");
+    let user_agent = if is_enterprise { "jetski" } else { "antigravity" };
+
+    // 8. Final wrapper with enabledCreditTypes (critical for upstream API)
+    let mut final_body = json!({
+        "project": project_id,
+        "request": Value::Object(inner_request),
+        "model": model,
+        "userAgent": user_agent,
+        "requestType": "agent",
+        "requestId": official_request_id,
+        "enabledCreditTypes": ["GOOGLE_ONE_AI"],
+    });
+
+    final_body
+}
+
+/// Extract parts from an Anthropic message.
+///
+/// Anthropic content can be:
+///   - A string: `"content": "Hello"` (simple text)
+///   - An array of content blocks: `"content": [{"type": "text", "text": "..."}, {"type": "tool_use", ...}]`
+///   - An array with tool_result blocks (from user role): `[{"type": "tool_result", ...}]`
+fn extract_parts_from_anthropic_message(msg: &Value) -> Vec<Value> {
+    let mut parts = Vec::new();
+
+    match msg.get("content") {
+        Some(Value::String(text)) => {
+            parts.push(json!({"text": text}));
+        }
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match block_type {
+                    "text" => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(json!({"text": text}));
+                        }
+                    }
+                    "thinking" => {
+                        // Thinking blocks from previous assistant turns — include as text
+                        if let Some(thinking_text) = block.get("thinking").and_then(|t| t.as_str())
+                        {
+                            parts.push(json!({"thought": true, "text": thinking_text}));
+                        }
+                    }
+                    "tool_use" => {
+                        // Assistant requesting tool use
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let input = block.get("input").cloned().unwrap_or(json!({}));
+                        parts.push(json!({
+                            "functionCall": {
+                                "name": name,
+                                "args": input
+                            }
+                        }));
+                    }
+                    "tool_result" => {
+                        // User providing tool results
+                        let tool_use_id =
+                            block.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("");
+                        let content = match block.get("content") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(Value::Array(arr)) => {
+                                // Extract text from content array
+                                arr.iter()
+                                    .filter_map(|b| {
+                                        if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                            b.get("text").and_then(|t| t.as_str()).map(String::from)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            }
+                            _ => String::new(),
+                        };
+                        let is_error = block
+                            .get("is_error")
+                            .and_then(|e| e.as_bool())
+                            .unwrap_or(false);
+                        parts.push(json!({
+                            "functionResponse": {
+                                "name": tool_use_id,
+                                "response": {
+                                    "result": content,
+                                    "error": is_error
+                                }
+                            }
+                        }));
+                    }
+                    "image" => {
+                        // Image content — pass through as inline data
+                        if let Some(source) = block.get("source") {
+                            let media_type = source
+                                .get("media_type")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("image/png");
+                            let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                            parts.push(json!({
+                                "inlineData": {
+                                    "mimeType": media_type,
+                                    "data": data
+                                }
+                            }));
+                        }
+                    }
+                    _ => {
+                        // Unknown block type — include as text if possible
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(json!({"text": text}));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    parts
+}
+
+/// Extract system instruction from Anthropic body.
+/// Anthropic "system" can be a string or an array of content blocks.
+fn extract_system_instruction(body: &Value) -> Option<Value> {
+    match body.get("system") {
+        Some(Value::String(text)) => Some(json!({
+            "role": "user",
+            "parts": [{"text": text}]
+        })),
+        Some(Value::Array(blocks)) => {
+            let parts: Vec<Value> = blocks
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|text| json!({"text": text}))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "role": "user",
+                    "parts": parts
+                }))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convert Anthropic tools format to Gemini function declarations.
+///
+/// Anthropic format:
+/// ```json
+/// {"name": "grep_search", "description": "...", "input_schema": {"type": "object", "properties": {...}}}
+/// ```
+///
+/// Gemini format:
+/// ```json
+/// [{"functionDeclarations": [{"name": "grep_search", "description": "...", "parameters": {...}}]}]
+/// ```
+fn convert_anthropic_tools(body: &Value) -> Option<Value> {
+    let tools = body.get("tools")?.as_array()?;
+    if tools.is_empty() {
+        return None;
+    }
+
+    let declarations: Vec<Value> = tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?;
+            let description = tool
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let parameters = tool
+                .get("input_schema")
+                .cloned()
+                .unwrap_or(json!({"type": "object", "properties": {}}));
+
+            Some(json!({
+                "name": name,
+                "description": description,
+                "parameters": parameters
+            }))
+        })
+        .collect();
+
+    if declarations.is_empty() {
+        None
+    } else {
+        Some(json!([{
+            "functionDeclarations": declarations
+        }]))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Response transformation: Gemini SSE → Anthropic SSE
+// ──────────────────────────────────────────────────────────────
+
+/// State machine for converting Gemini SSE stream to Anthropic SSE stream.
+struct AnthropicSseConverter {
+    model: String,
+    message_id: String,
+    content_index: usize,
+    started: bool,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    has_tool_use: bool,
+    /// Buffer for incomplete SSE lines
+    line_buffer: String,
+}
+
+impl AnthropicSseConverter {
+    fn new(model: &str) -> Self {
+        let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..24].to_string());
+        Self {
+            model: model.to_string(),
+            message_id,
+            content_index: 0,
+            started: false,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            has_tool_use: false,
+            line_buffer: String::new(),
+        }
+    }
+
+    /// Generate the initial message_start event
+    fn message_start(&mut self, input_tokens: u64) -> String {
+        self.started = true;
+        self.total_input_tokens = input_tokens;
+        format!(
+            "event: message_start\ndata: {}\n\n",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 1
+                    }
+                }
+            })
+        )
+    }
+
+    /// Generate content_block_start for a text block
+    fn text_block_start(&mut self) -> String {
+        let idx = self.content_index;
+        format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            })
+        )
+    }
+
+    /// Generate content_block_start for a thinking block
+    fn thinking_block_start(&mut self) -> String {
+        let idx = self.content_index;
+        format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": ""
+                }
+            })
+        )
+    }
+
+    /// Generate a text delta
+    fn text_delta(&self, text: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.content_index,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text
+                }
+            })
+        )
+    }
+
+    /// Generate a thinking delta
+    fn thinking_delta(&self, text: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.content_index,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": text
+                }
+            })
+        )
+    }
+
+    /// Generate content_block_stop
+    fn content_block_stop(&mut self) -> String {
+        let idx = self.content_index;
+        self.content_index += 1;
+        format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            json!({
+                "type": "content_block_stop",
+                "index": idx
+            })
+        )
+    }
+
+    /// Generate tool_use content block start
+    fn tool_use_block_start(&mut self, id: &str, name: &str) -> String {
+        self.has_tool_use = true;
+        let idx = self.content_index;
+        format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": {}
+                }
+            })
+        )
+    }
+
+    /// Generate tool_use input JSON delta
+    fn tool_use_delta(&self, partial_json: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.content_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": partial_json
+                }
+            })
+        )
+    }
+
+    /// Generate message_delta (stop event)
+    fn message_delta(&self, stop_reason: &str, output_tokens: u64) -> String {
+        format!(
+            "event: message_delta\ndata: {}\n\n",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "output_tokens": output_tokens
+                }
+            })
+        )
+    }
+
+    /// Generate message_stop
+    fn message_stop(&self) -> String {
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string()
+    }
+
+    /// Generate a ping event
+    fn ping(&self) -> String {
+        "event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string()
+    }
+
+    /// Process a complete Gemini SSE data line and return Anthropic SSE events.
+    ///
+    /// A Gemini SSE event looks like:
+    /// `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]},"finishReason":"STOP"}],...}`
+    fn process_gemini_event(&mut self, data_json: &str) -> Vec<String> {
+        let mut events = Vec::new();
+
+        let parsed: Value = match serde_json::from_str(data_json) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[AnthropicBridge] Failed to parse Gemini SSE: {} — data: {}...", e, &data_json[..data_json.len().min(200)]);
+                return events;
+            }
+        };
+
+        // Unwrap response wrapper if present
+        let response_obj = parsed.get("response").unwrap_or(&parsed);
+
+        // Extract usage metadata
+        if let Some(usage) = response_obj.get("usageMetadata") {
+            let input = usage
+                .get("promptTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output = usage
+                .get("candidatesTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            self.total_input_tokens = input;
+            self.total_output_tokens = output;
+        }
+
+        // Emit message_start on first event
+        if !self.started {
+            let input_tokens = response_obj
+                .get("usageMetadata")
+                .and_then(|u| u.get("promptTokenCount"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            events.push(self.message_start(input_tokens));
+            events.push(self.ping());
+        }
+
+        // Process candidates
+        if let Some(candidates) = response_obj.get("candidates").and_then(|c| c.as_array()) {
+            for candidate in candidates {
+                if let Some(content) = candidate.get("content") {
+                    if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                        for part in parts {
+                            // Check if it's a thinking part
+                            if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    // Emit thinking block
+                                    events.push(self.thinking_block_start());
+                                    events.push(self.thinking_delta(text));
+                                    events.push(self.content_block_stop());
+                                }
+                            } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                // Regular text part
+                                events.push(self.text_block_start());
+                                events.push(self.text_delta(text));
+                                events.push(self.content_block_stop());
+                            } else if let Some(fc) = part.get("functionCall") {
+                                // Function call → tool_use
+                                let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                                let args = fc.get("args").cloned().unwrap_or(json!({}));
+                                let tool_id = format!("toolu_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
+
+                                events.push(self.tool_use_block_start(&tool_id, name));
+                                let args_str = serde_json::to_string(&args).unwrap_or_default();
+                                events.push(self.tool_use_delta(&args_str));
+                                events.push(self.content_block_stop());
+                            }
+                        }
+                    }
+                }
+
+                // Check finish reason
+                if let Some(finish) = candidate.get("finishReason").and_then(|f| f.as_str()) {
+                    let stop_reason = match finish {
+                        "STOP" => {
+                            if self.has_tool_use {
+                                "tool_use"
+                            } else {
+                                "end_turn"
+                            }
+                        }
+                        "MAX_TOKENS" => "max_tokens",
+                        "SAFETY" => "end_turn",
+                        _ => "end_turn",
+                    };
+                    events.push(self.message_delta(stop_reason, self.total_output_tokens));
+                    events.push(self.message_stop());
+                }
+            }
+        }
+
+        events
+    }
+
+    /// Process raw bytes from the upstream Gemini SSE stream.
+    /// Handles line buffering for incomplete chunks.
+    fn process_chunk(&mut self, chunk: &[u8]) -> Vec<String> {
+        let text = match std::str::from_utf8(chunk) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        self.line_buffer.push_str(text);
+
+        let mut events = Vec::new();
+
+        // Process complete SSE lines (separated by \n\n or \r\n\r\n)
+        loop {
+            // Find end of SSE event
+            let boundary = if let Some(pos) = self.line_buffer.find("\n\n") {
+                Some((pos, 2))
+            } else if let Some(pos) = self.line_buffer.find("\r\n\r\n") {
+                Some((pos, 4))
+            } else {
+                None
+            };
+
+            match boundary {
+                Some((pos, sep_len)) => {
+                    let event_text = self.line_buffer[..pos].to_string();
+                    self.line_buffer = self.line_buffer[pos + sep_len..].to_string();
+
+                    // Parse SSE event lines
+                    for line in event_text.lines() {
+                        let trimmed = line.trim();
+                        if let Some(data) = trimmed.strip_prefix("data:") {
+                            let data = data.trim();
+                            if !data.is_empty() && data != "[DONE]" {
+                                let mut new_events = self.process_gemini_event(data);
+                                events.append(&mut new_events);
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+
+        events
+    }
+}
+
+/// Create a streaming response that transforms Gemini SSE → Anthropic SSE.
+///
+/// Takes a reqwest response with Gemini SSE body and returns an axum Body
+/// that emits Anthropic SSE events.
+pub fn create_anthropic_sse_stream(
+    upstream_response: reqwest::Response,
+    model: &str,
+) -> axum::body::Body {
+    let model = model.to_string();
+
+    let stream = async_stream::stream! {
+        let mut converter = AnthropicSseConverter::new(&model);
+        let mut byte_stream = upstream_response.bytes_stream();
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    let events = converter.process_chunk(&chunk);
+                    for event in events {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("[AnthropicBridge] Stream error: {}", e);
+                    // Emit an error event and stop
+                    let error_event = format!(
+                        "event: error\ndata: {}\n\n",
+                        json!({"type": "error", "error": {"type": "server_error", "message": format!("Upstream error: {}", e)}})
+                    );
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(error_event));
+                    break;
+                }
+            }
+        }
+
+        // Ensure message_stop is sent if stream ends without finishReason
+        if converter.started && converter.content_index == 0 {
+            // Stream ended without any content — emit minimal valid response
+            let events = vec![
+                converter.text_block_start(),
+                converter.text_delta(""),
+                converter.content_block_stop(),
+                converter.message_delta("end_turn", converter.total_output_tokens),
+                converter.message_stop(),
+            ];
+            for event in events {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
+            }
+        }
+    };
+
+    axum::body::Body::from_stream(stream)
+}
+
+/// Create a non-streaming Anthropic response from a Gemini response body.
+pub fn create_anthropic_response(gemini_body: &str, model: &str) -> Value {
+    let parsed: Value = serde_json::from_str(gemini_body).unwrap_or(json!({}));
+
+    let message_id = format!(
+        "msg_{}",
+        &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+    );
+
+    // Extract text and tool calls from Gemini response
+    let mut content_blocks: Vec<Value> = Vec::new();
+    let mut stop_reason = "end_turn";
+    let mut has_tool_use = false;
+    // Gemini v1internal wraps response: {"response": {"candidates": [...]}} or direct {"candidates": [...]}
+    let response_obj = parsed.get("response").unwrap_or(&parsed);
+
+    if let Some(candidates) = response_obj.get("candidates").and_then(|c| c.as_array()) {
+        for candidate in candidates {
+            if let Some(content) = candidate.get("content") {
+                if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                    for part in parts {
+                        if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                content_blocks.push(json!({
+                                    "type": "thinking",
+                                    "thinking": text
+                                }));
+                            }
+                        } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            content_blocks.push(json!({
+                                "type": "text",
+                                "text": text
+                            }));
+                        } else if let Some(fc) = part.get("functionCall") {
+                            has_tool_use = true;
+                            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                            let args = fc.get("args").cloned().unwrap_or(json!({}));
+                            let tool_id = format!(
+                                "toolu_{}",
+                                &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+                            );
+                            content_blocks.push(json!({
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": name,
+                                "input": args
+                            }));
+                        }
+                    }
+                }
+            }
+
+            if let Some(finish) = candidate.get("finishReason").and_then(|f| f.as_str()) {
+                stop_reason = match finish {
+                    "STOP" => {
+                        if has_tool_use {
+                            "tool_use"
+                        } else {
+                            "end_turn"
+                        }
+                    }
+                    "MAX_TOKENS" => "max_tokens",
+                    _ => "end_turn",
+                };
+            }
+        }
+    }
+
+    // Extract usage
+    let input_tokens = response_obj
+        .get("usageMetadata")
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = response_obj
+        .get("usageMetadata")
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    json!({
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content_blocks,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_anthropic_format_by_system() {
+        let body = json!({"model": "claude-opus-4-6-thinking", "system": "You are helpful", "messages": []});
+        let headers = axum::http::HeaderMap::new();
+        assert!(is_anthropic_format(&body, &headers));
+    }
+
+    #[test]
+    fn test_detect_openai_format() {
+        let body = json!({"model": "gpt-4", "messages": [{"role": "system", "content": "You are helpful"}]});
+        let headers = axum::http::HeaderMap::new();
+        assert!(!is_anthropic_format(&body, &headers));
+    }
+
+    #[test]
+    fn test_detect_anthropic_format_by_tools() {
+        let body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "tools": [{"name": "test", "description": "test", "input_schema": {"type": "object"}}],
+            "messages": []
+        });
+        let headers = axum::http::HeaderMap::new();
+        assert!(is_anthropic_format(&body, &headers));
+    }
+
+    #[test]
+    fn test_extract_system_string() {
+        let body = json!({"system": "You are a helpful assistant"});
+        let result = extract_system_instruction(&body);
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(
+            parts["parts"][0]["text"].as_str().unwrap(),
+            "You are a helpful assistant"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools() {
+        let body = json!({
+            "tools": [{
+                "name": "grep_search",
+                "description": "Search files",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }
+            }]
+        });
+        let result = convert_anthropic_tools(&body);
+        assert!(result.is_some());
+        let tools = result.unwrap();
+        let decls = tools[0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["name"].as_str().unwrap(), "grep_search");
+    }
+}

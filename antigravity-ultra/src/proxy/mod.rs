@@ -1,3 +1,4 @@
+mod anthropic_bridge;
 mod token_manager;
 
 use crate::account::import::AccountEntry;
@@ -187,7 +188,7 @@ async fn handle_chat_completions(
         account.email
     );
 
-    // 3. Parse OpenAI request body
+    // 3. Parse request body
     let body_json: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -199,20 +200,44 @@ async fn handle_chat_completions(
         }
     };
 
-    let model = body_json
+    let raw_model = body_json
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("gemini-2.0-flash");
 
-    let is_stream = body_json
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
+    // Map model name to v1internal-compatible name (matches Tauri CLAUDE_TO_GEMINI table)
+    let model = map_model_name(raw_model);
 
-    // 4. Transform OpenAI body → Gemini v1internal format
-    let gemini_body = transform_openai_to_gemini(&body_json, model, &account);
+    // 4. Detect protocol format (Anthropic vs OpenAI)
+    let is_anthropic = anthropic_bridge::is_anthropic_format(&body_json, &headers);
+    let is_stream = if is_anthropic {
+        anthropic_bridge::detect_stream(&body_json, &headers)
+    } else {
+        body_json
+            .get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false)
+    };
 
-    // 5. Build upstream URL (use stream endpoint when streaming)
+    let is_claude = model.to_lowercase().contains("claude");
+
+    tracing::info!(
+        "[Proxy] Protocol: {}, Stream: {}, Model: {} (raw: {}), Claude: {}",
+        if is_anthropic { "Anthropic" } else { "OpenAI" },
+        is_stream,
+        model,
+        raw_model,
+        is_claude,
+    );
+
+    // 5. Transform request body to Gemini v1internal format
+    let gemini_body = if is_anthropic {
+        anthropic_bridge::transform_anthropic_to_gemini(&body_json, &model, &account)
+    } else {
+        transform_openai_to_gemini(&body_json, &model, &account)
+    };
+
+    // 6. Build upstream URL
     let (method_name, query_string) = if is_stream {
         ("streamGenerateContent", Some("alt=sse"))
     } else {
@@ -220,19 +245,15 @@ async fn handle_chat_completions(
     };
 
     let http_client = crate::utils::http::get_streaming_client();
-
-    // Build extra headers for Claude models
-    let is_claude = model.to_lowercase().contains("claude");
-
     let body_str = serde_json::to_string(&gemini_body).unwrap_or_default();
 
-    // 6. Try endpoints with fallback (Sandbox → Daily → Prod)
-    // Outer loop: retry without x-goog-user-project on 403 SERVICE_DISABLED
-    let mut use_project_header = true;
+    // 7. Try endpoints with fallback (Sandbox → Daily → Prod)
+    // Two-pass strategy (matches Tauri source):
+    //   Pass 0: WITH x-goog-user-project header
+    //   Pass 1: WITHOUT header (triggered only if 403 SERVICE_DISABLED detected)
+    let mut skip_project_header = false;
 
-    for attempt in 0..2u8 {
-        let mut last_err: Option<String> = None;
-
+    for pass in 0..2u8 {
         for base_url in &V1_INTERNAL_URLS {
             let upstream_url = if let Some(qs) = query_string {
                 format!("{}:{}?{}", base_url, method_name, qs)
@@ -249,8 +270,8 @@ async fn handle_chat_completions(
                 .header("x-client-version", crate::constants::CURRENT_VERSION.as_str())
                 .header("x-vscode-sessionid", crate::constants::SESSION_ID.as_str());
 
-            // Inject project header (skip on retry after 403)
-            if use_project_header {
+            // Inject project header (skip on pass 1 after 403 SERVICE_DISABLED)
+            if !skip_project_header {
                 if let Some(ref project_id) = account.token.project_id {
                     req = req.header("x-goog-user-project", project_id.as_str());
                 }
@@ -267,19 +288,25 @@ async fn handle_chat_completions(
                 Ok(resp) => {
                     let status = resp.status();
 
-                    // Handle 403 SERVICE_DISABLED → retry without project header
-                    if status.as_u16() == 403 && use_project_header {
+                    // Handle 403 → on first pass, trigger retry without project header
+                    if status.as_u16() == 403 && !skip_project_header {
                         let err_body = resp.text().await.unwrap_or_default();
                         if err_body.contains("SERVICE_DISABLED") || err_body.contains("has not been used") {
                             tracing::warn!(
-                                "[Proxy] 403 SERVICE_DISABLED with project header — retrying WITHOUT x-goog-user-project (account: {})",
+                                "[Proxy] 403 SERVICE_DISABLED — will retry without x-goog-user-project (account: {})",
                                 account.email
                             );
-                            use_project_header = false;
-                            break; // Break inner loop to restart with all endpoints
+                            skip_project_header = true;
+                            break; // Break inner loop, trigger pass 1
                         }
                         // Other 403 errors — try next endpoint
-                        last_err = Some(format!("403: {}", err_body));
+                        tracing::warn!("[Proxy] Endpoint {} returned 403 — trying next", upstream_url);
+                        continue;
+                    }
+
+                    // Handle 403 on pass 2 (already without project header) — try next endpoint
+                    if status.as_u16() == 403 {
+                        tracing::warn!("[Proxy] Endpoint {} returned 403 (no project header) — trying next", upstream_url);
                         continue;
                     }
 
@@ -288,91 +315,112 @@ async fn handle_chat_completions(
                         let err_body = resp.text().await.unwrap_or_default();
                         tracing::warn!(
                             "[Proxy] Endpoint {} returned {} — trying next fallback",
-                            upstream_url,
-                            status
+                            upstream_url, status
                         );
-                        last_err = Some(format!("Endpoint {} returned {}: {}", upstream_url, status, err_body));
                         continue;
                     }
 
-                    // Success or client error (4xx other than 403/404) — return response
+                    // ─── SUCCESS: Build response based on protocol ───
                     if is_stream {
-                        let stream = resp.bytes_stream();
-                        let body = Body::from_stream(stream);
-
-                        return Response::builder()
-                            .status(status.as_u16())
-                            .header("content-type", "text/event-stream")
-                            .header("cache-control", "no-cache")
-                            .header("connection", "keep-alive")
-                            .body(body)
-                            .unwrap_or_else(|_| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Stream error".to_string(),
-                                )
-                                    .into_response()
-                            });
+                        if is_anthropic {
+                            tracing::info!(
+                                "[Proxy] Streaming Gemini→Anthropic SSE bridge for {} ({})",
+                                model, upstream_url,
+                            );
+                            let body = anthropic_bridge::create_anthropic_sse_stream(resp, raw_model);
+                            return Response::builder()
+                                .status(200)
+                                .header("content-type", "text/event-stream")
+                                .header("cache-control", "no-cache")
+                                .header("connection", "keep-alive")
+                                .body(body)
+                                .unwrap_or_else(|_| {
+                                    (StatusCode::INTERNAL_SERVER_ERROR, "Stream error".to_string()).into_response()
+                                });
+                        } else {
+                            let stream = resp.bytes_stream();
+                            let body = Body::from_stream(stream);
+                            return Response::builder()
+                                .status(status.as_u16())
+                                .header("content-type", "text/event-stream")
+                                .header("cache-control", "no-cache")
+                                .header("connection", "keep-alive")
+                                .body(body)
+                                .unwrap_or_else(|_| {
+                                    (StatusCode::INTERNAL_SERVER_ERROR, "Stream error".to_string()).into_response()
+                                });
+                        }
                     } else {
                         let resp_status = status.as_u16();
                         let resp_body = resp.text().await.unwrap_or_default();
 
-                        return Response::builder()
-                            .status(resp_status)
-                            .header("content-type", "application/json")
-                            .body(Body::from(resp_body))
-                            .unwrap_or_else(|_| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Response error".to_string(),
-                                )
-                                    .into_response()
-                            });
+                        if is_anthropic {
+                            tracing::debug!(
+                                "[Proxy] Raw upstream body for Anthropic transform ({}B): {}",
+                                resp_body.len(),
+                                &resp_body[..resp_body.len().min(500)]
+                            );
+                            let anthropic_resp = anthropic_bridge::create_anthropic_response(&resp_body, raw_model);
+                            return Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(Body::from(serde_json::to_string(&anthropic_resp).unwrap_or_default()))
+                                .unwrap_or_else(|_| {
+                                    (StatusCode::INTERNAL_SERVER_ERROR, "Response error".to_string()).into_response()
+                                });
+                        } else {
+                            return Response::builder()
+                                .status(resp_status)
+                                .header("content-type", "application/json")
+                                .body(Body::from(resp_body))
+                                .unwrap_or_else(|_| {
+                                    (StatusCode::INTERNAL_SERVER_ERROR, "Response error".to_string()).into_response()
+                                });
+                        }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "[Proxy] Endpoint {} connection error: {} — trying next",
-                        upstream_url,
-                        e
-                    );
-                    last_err = Some(format!("Connection error: {}", e));
+                    tracing::warn!("[Proxy] Endpoint {} connection error: {} — trying next", upstream_url, e);
                     continue;
                 }
             }
         }
 
-        // If we broke out of inner loop for 403 retry, continue outer loop
-        if attempt == 0 && !use_project_header {
+        // If pass 0 triggered 403 fallback, continue to pass 1
+        if skip_project_header && pass == 0 {
             tracing::info!("[Proxy] Retrying all endpoints without project header...");
             continue;
         }
+        break;
+    }
 
-        // All endpoints exhausted
-        tracing::error!("[Proxy] All upstream endpoints failed (attempt {})", attempt + 1);
-        return (
+    // All endpoints exhausted
+    tracing::error!("[Proxy] All upstream endpoints failed");
+
+    if is_anthropic {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "All upstream endpoints failed"
+                }
+            })),
+        )
+            .into_response()
+    } else {
+        (
             StatusCode::BAD_GATEWAY,
             Json(json!({
                 "error": {
-                    "message": format!("All upstream endpoints failed: {}", last_err.unwrap_or_default()),
+                    "message": "All upstream endpoints failed",
                     "type": "server_error"
                 }
             })),
         )
-            .into_response();
+            .into_response()
     }
-
-    // Should not reach here, but safety fallback
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({
-            "error": {
-                "message": "All upstream endpoints failed after retries",
-                "type": "server_error"
-            }
-        })),
-    )
-        .into_response()
 }
 
 /// Transform OpenAI chat completion request to Gemini v1internal format
@@ -444,45 +492,58 @@ fn transform_openai_to_gemini(openai_body: &Value, model: &str, account: &crate:
         hash
     });
 
-    // Build the inner "request" object (Gemini format)
-    let mut inner_request = json!({
-        "contents": contents,
-        "generationConfig": generation_config,
-        "safetySettings": [
-            { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
-            { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
-            { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
-            { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
-        ],
-        "sessionId": session_id,
-    });
+    // Build the inner "request" object with stable field ordering (matches Tauri source)
+    // Order: systemInstruction → tools → toolConfig → generationConfig → safetySettings → sessionId → contents
+    let mut inner_request = serde_json::Map::new();
 
-    // Add system instruction if present
+    // systemInstruction first (stable, benefits prefix caching)
     if !system_parts.is_empty() {
-        inner_request["systemInstruction"] = json!({
+        inner_request.insert("systemInstruction".to_string(), json!({
             "role": "user",
             "parts": system_parts
-        });
+        }));
     }
 
-    let message_count = openai_body
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
+    // generationConfig
+    inner_request.insert("generationConfig".to_string(), generation_config);
 
-    // Build final body with "request" wrapper (matches Tauri source structure)
+    // safetySettings
+    inner_request.insert("safetySettings".to_string(), json!([
+        { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
+        { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
+        { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
+        { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
+    ]));
+
+    // sessionId
+    inner_request.insert("sessionId".to_string(), json!(session_id));
+
+    // contents last (dynamic)
+    inner_request.insert("contents".to_string(), json!(contents));
+
+    // Build official requestId: agent/{timestamp_ms}/{random_hex_8bytes}
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let random_hex = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let official_request_id = format!("agent/{}/{}", timestamp_ms, random_hex);
+
+    // Determine userAgent based on account type
+    let is_enterprise = !account.email.ends_with("@gmail.com") && !account.email.ends_with("@googlemail.com");
+    let user_agent = if is_enterprise { "jetski" } else { "antigravity" };
+
+    // Build final body with enabledCreditTypes (critical for upstream API)
     let final_body = json!({
         "project": project_id,
-        "request": inner_request,
+        "request": Value::Object(inner_request),
         "model": model,
-        "userAgent": "antigravity",
+        "userAgent": user_agent,
         "requestType": "agent",
-        "requestId": format!("agent/antigravity/{}/{}", &session_id[..session_id.len().min(8)], message_count),
+        "requestId": official_request_id,
+        "enabledCreditTypes": ["GOOGLE_ONE_AI"],
     });
 
     final_body
 }
+
 
 /// GET /v1/models
 async fn handle_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -602,3 +663,49 @@ async fn healthcheck_loop(token_manager: Arc<TokenManager>, interval_seconds: u6
         token_manager.refresh_all_tokens().await;
     }
 }
+
+/// Map model names to v1internal-compatible names
+/// Matches the Tauri source's CLAUDE_TO_GEMINI mapping table
+fn map_model_name(input: &str) -> String {
+    match input {
+        // Anthropic SDK versioned IDs → internal names
+        "claude-sonnet-4-20250514" => "claude-sonnet-4-6".to_string(),
+        "claude-sonnet-4-5-20250514" => "claude-sonnet-4-6".to_string(),
+        "claude-sonnet-4-5-20250929" => "claude-sonnet-4-6-thinking".to_string(),
+        "claude-3-5-sonnet-20241022" => "claude-sonnet-4-6".to_string(),
+        "claude-3-5-sonnet-20240620" => "claude-sonnet-4-6".to_string(),
+
+        // Sonnet aliases
+        "claude-sonnet-4-5" => "claude-sonnet-4-6".to_string(),
+        "claude-sonnet-4-5-thinking" => "claude-sonnet-4-6-thinking".to_string(),
+        "claude-sonnet-4-6" => "claude-sonnet-4-6".to_string(),
+        "claude-sonnet-4-6-thinking" => "claude-sonnet-4-6-thinking".to_string(),
+
+        // Opus aliases
+        "claude-opus-4" => "claude-opus-4-6-thinking".to_string(),
+        "claude-opus-4-5-thinking" => "claude-opus-4-6-thinking".to_string(),
+        "claude-opus-4-5-20251101" => "claude-opus-4-6-thinking".to_string(),
+        "claude-opus-4-6" => "claude-opus-4-6-thinking".to_string(),
+        "claude-opus-4-6-thinking" => "claude-opus-4-6-thinking".to_string(),
+        "claude-opus-4-6-20260201" => "claude-opus-4-6-thinking".to_string(),
+
+        // Haiku → Sonnet
+        "claude-haiku-4" => "claude-sonnet-4-6".to_string(),
+        "claude-3-haiku-20240307" => "claude-sonnet-4-6".to_string(),
+        "claude-haiku-4-5-20251001" => "claude-sonnet-4-6".to_string(),
+
+        // OpenAI → Gemini
+        "gpt-4" | "gpt-4-turbo" | "gpt-4o" | "gpt-4o-mini" => "gemini-2.5-flash".to_string(),
+        "gpt-3.5-turbo" | "gpt-3.5-turbo-16k" => "gemini-2.5-flash".to_string(),
+
+        // Gemini pass-through & aliases
+        "gemini-3.1-pro-high" => "gemini-pro-agent".to_string(),
+        "gemini-3.1-pro" => "gemini-3.1-pro-preview".to_string(),
+        "gemini-3-pro-high" => "gemini-pro-agent".to_string(),
+        "gemini-3-pro" => "gemini-3-pro-preview".to_string(),
+
+        // Default: pass through unchanged
+        _ => input.to_string(),
+    }
+}
+
