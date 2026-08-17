@@ -150,6 +150,13 @@ pub fn transform_anthropic_to_gemini(
             generation_config["thinkingConfig"] = json!({
                 "thinkingBudget": budget
             });
+            // Ensure maxOutputTokens > thinkingBudget (Gemini requirement)
+            let current_max = generation_config.get("maxOutputTokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if current_max <= budget {
+                generation_config["maxOutputTokens"] = json!(budget + 8000);
+            }
         }
     }
 
@@ -364,6 +371,42 @@ fn extract_system_instruction(body: &Value) -> Option<Value> {
     }
 }
 
+/// Fields that Gemini does not support in JSON Schema for function declarations.
+/// These must be stripped recursively from tool parameter definitions.
+const UNSUPPORTED_SCHEMA_FIELDS: &[&str] = &[
+    "$schema", "$id", "$ref", "$comment",
+    "propertyNames", "const", "exclusiveMinimum", "exclusiveMaximum",
+    "if", "then", "else", "allOf", "anyOf", "oneOf", "not",
+    "patternProperties", "additionalItems", "contains",
+    "dependencies", "contentMediaType", "contentEncoding",
+    "examples", "default", "readOnly", "writeOnly",
+    "minContains", "maxContains", "deprecated",
+    "$defs", "definitions",
+];
+
+/// Recursively strip unsupported JSON Schema fields from a value.
+fn strip_unsupported_schema_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            // Remove unsupported top-level fields
+            for field in UNSUPPORTED_SCHEMA_FIELDS {
+                map.remove(*field);
+            }
+            // Also handle "any_of" which Gemini doesn't support
+            // Recurse into remaining fields
+            for (_, v) in map.iter_mut() {
+                strip_unsupported_schema_fields(v);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                strip_unsupported_schema_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert Anthropic tools format to Gemini function declarations.
 ///
 /// Anthropic format:
@@ -389,10 +432,13 @@ fn convert_anthropic_tools(body: &Value) -> Option<Value> {
                 .get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("");
-            let parameters = tool
+            let mut parameters = tool
                 .get("input_schema")
                 .cloned()
                 .unwrap_or(json!({"type": "object", "properties": {}}));
+
+            // Strip unsupported JSON Schema fields for Gemini compatibility
+            strip_unsupported_schema_fields(&mut parameters);
 
             Some(json!({
                 "name": name,
@@ -426,6 +472,8 @@ struct AnthropicSseConverter {
     has_tool_use: bool,
     /// Buffer for incomplete SSE lines
     line_buffer: String,
+    /// Track the currently open block type: None, "text", "thinking", "tool_use"
+    current_block_type: Option<String>,
 }
 
 impl AnthropicSseConverter {
@@ -440,6 +488,7 @@ impl AnthropicSseConverter {
             total_output_tokens: 0,
             has_tool_use: false,
             line_buffer: String::new(),
+            current_block_type: None,
         }
     }
 
@@ -656,18 +705,31 @@ impl AnthropicSseConverter {
                             // Check if it's a thinking part
                             if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                    // Emit thinking block
-                                    events.push(self.thinking_block_start());
+                                    // If a different block type is open, close it first
+                                    if self.current_block_type.as_deref() != Some("thinking") {
+                                        if self.current_block_type.is_some() {
+                                            events.push(self.content_block_stop());
+                                        }
+                                        events.push(self.thinking_block_start());
+                                        self.current_block_type = Some("thinking".to_string());
+                                    }
                                     events.push(self.thinking_delta(text));
-                                    events.push(self.content_block_stop());
                                 }
                             } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                // Regular text part
-                                events.push(self.text_block_start());
+                                // Regular text part — reuse open text block or open a new one
+                                if self.current_block_type.as_deref() != Some("text") {
+                                    if self.current_block_type.is_some() {
+                                        events.push(self.content_block_stop());
+                                    }
+                                    events.push(self.text_block_start());
+                                    self.current_block_type = Some("text".to_string());
+                                }
                                 events.push(self.text_delta(text));
-                                events.push(self.content_block_stop());
                             } else if let Some(fc) = part.get("functionCall") {
-                                // Function call → tool_use
+                                // Function call → tool_use (each tool is its own block)
+                                if self.current_block_type.is_some() {
+                                    events.push(self.content_block_stop());
+                                }
                                 let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                                 let args = fc.get("args").cloned().unwrap_or(json!({}));
                                 let tool_id = format!("toolu_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
@@ -675,7 +737,7 @@ impl AnthropicSseConverter {
                                 events.push(self.tool_use_block_start(&tool_id, name));
                                 let args_str = serde_json::to_string(&args).unwrap_or_default();
                                 events.push(self.tool_use_delta(&args_str));
-                                events.push(self.content_block_stop());
+                                self.current_block_type = Some("tool_use".to_string());
                             }
                         }
                     }
@@ -683,6 +745,11 @@ impl AnthropicSseConverter {
 
                 // Check finish reason
                 if let Some(finish) = candidate.get("finishReason").and_then(|f| f.as_str()) {
+                    // Close any open content block before message_delta
+                    if self.current_block_type.is_some() {
+                        events.push(self.content_block_stop());
+                        self.current_block_type = None;
+                    }
                     let stop_reason = match finish {
                         "STOP" => {
                             if self.has_tool_use {

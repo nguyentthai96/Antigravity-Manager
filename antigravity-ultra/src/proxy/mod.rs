@@ -355,11 +355,39 @@ async fn handle_chat_completions(
                         let resp_body = resp.text().await.unwrap_or_default();
 
                         if is_anthropic {
-                            tracing::debug!(
+                            tracing::info!(
                                 "[Proxy] Raw upstream body for Anthropic transform ({}B): {}",
                                 resp_body.len(),
-                                &resp_body[..resp_body.len().min(500)]
+                                &resp_body[..resp_body.len().min(2000)]
                             );
+
+                            // Check if upstream returned an error
+                            if resp_status >= 400 {
+                                let error_msg = if let Ok(parsed) = serde_json::from_str::<Value>(&resp_body) {
+                                    parsed.get("error")
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("Upstream error")
+                                        .to_string()
+                                } else {
+                                    resp_body.clone()
+                                };
+                                tracing::error!("[Proxy] Upstream error {}: {}", resp_status, &error_msg[..error_msg.len().min(500)]);
+                                return Response::builder()
+                                    .status(resp_status)
+                                    .header("content-type", "application/json")
+                                    .body(Body::from(serde_json::to_string(&json!({
+                                        "type": "error",
+                                        "error": {
+                                            "type": "api_error",
+                                            "message": error_msg
+                                        }
+                                    })).unwrap_or_default()))
+                                    .unwrap_or_else(|_| {
+                                        (StatusCode::INTERNAL_SERVER_ERROR, "Error response").into_response()
+                                    });
+                            }
+
                             let anthropic_resp = anthropic_bridge::create_anthropic_response(&resp_body, raw_model);
                             return Response::builder()
                                 .status(200)
@@ -479,6 +507,13 @@ fn transform_openai_to_gemini(openai_body: &Value, model: &str, account: &crate:
             generation_config["thinkingConfig"] = json!({
                 "thinkingBudget": budget
             });
+            // Ensure maxOutputTokens > thinkingBudget (Gemini requirement)
+            let current_max = generation_config.get("maxOutputTokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if current_max <= budget {
+                generation_config["maxOutputTokens"] = json!(budget + 8000);
+            }
         }
     }
 
