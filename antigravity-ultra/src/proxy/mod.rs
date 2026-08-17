@@ -238,7 +238,10 @@ async fn handle_chat_completions(
     };
 
     // 6. Build upstream URL
-    let (method_name, query_string) = if is_stream {
+    // For Anthropic protocol, always use streaming internally (generateContent returns 500
+    // for some models). Non-streaming Anthropic requests will buffer the stream.
+    let use_internal_streaming = is_anthropic || is_stream;
+    let (method_name, query_string) = if use_internal_streaming {
         ("streamGenerateContent", Some("alt=sse"))
     } else {
         ("generateContent", None)
@@ -248,12 +251,13 @@ async fn handle_chat_completions(
     let body_str = serde_json::to_string(&gemini_body).unwrap_or_default();
 
     // 7. Try endpoints with fallback (Sandbox → Daily → Prod)
-    // Two-pass strategy (matches Tauri source):
-    //   Pass 0: WITH x-goog-user-project header
-    //   Pass 1: WITHOUT header (triggered only if 403 SERVICE_DISABLED detected)
-    let mut skip_project_header = false;
+    // Use cached skip_project_header from account (persisted after first 403 SERVICE_DISABLED)
+    let mut skip_project_header = account.skip_project_header;
 
-    for pass in 0..2u8 {
+    // If already cached, skip directly to pass 1 behavior
+    let start_pass: u8 = if skip_project_header { 1 } else { 0 };
+
+    for pass in start_pass..2u8 {
         for base_url in &V1_INTERNAL_URLS {
             let upstream_url = if let Some(qs) = query_string {
                 format!("{}:{}?{}", base_url, method_name, qs)
@@ -270,7 +274,7 @@ async fn handle_chat_completions(
                 .header("x-client-version", crate::constants::CURRENT_VERSION.as_str())
                 .header("x-vscode-sessionid", crate::constants::SESSION_ID.as_str());
 
-            // Inject project header (skip on pass 1 after 403 SERVICE_DISABLED)
+            // Inject project header only if not skipped
             if !skip_project_header {
                 if let Some(ref project_id) = account.token.project_id {
                     req = req.header("x-goog-user-project", project_id.as_str());
@@ -293,10 +297,12 @@ async fn handle_chat_completions(
                         let err_body = resp.text().await.unwrap_or_default();
                         if err_body.contains("SERVICE_DISABLED") || err_body.contains("has not been used") {
                             tracing::warn!(
-                                "[Proxy] 403 SERVICE_DISABLED — will retry without x-goog-user-project (account: {})",
+                                "[Proxy] 403 SERVICE_DISABLED — caching skip for {} and retrying",
                                 account.email
                             );
                             skip_project_header = true;
+                            // Persist the flag so future requests skip immediately
+                            state.token_manager.mark_skip_project_header(&account.id);
                             break; // Break inner loop, trigger pass 1
                         }
                         // Other 403 errors — try next endpoint
@@ -312,7 +318,7 @@ async fn handle_chat_completions(
 
                     // If 404 or server error, try next endpoint
                     if status.as_u16() == 404 || status.is_server_error() {
-                        let err_body = resp.text().await.unwrap_or_default();
+                        let _err_body = resp.text().await.unwrap_or_default();
                         tracing::warn!(
                             "[Proxy] Endpoint {} returned {} — trying next fallback",
                             upstream_url, status
@@ -321,8 +327,9 @@ async fn handle_chat_completions(
                     }
 
                     // ─── SUCCESS: Build response based on protocol ───
-                    if is_stream {
-                        if is_anthropic {
+                    if is_anthropic {
+                        if is_stream {
+                            // Streaming Anthropic — forward SSE stream directly
                             tracing::info!(
                                 "[Proxy] Streaming Gemini→Anthropic SSE bridge for {} ({})",
                                 model, upstream_url,
@@ -338,57 +345,12 @@ async fn handle_chat_completions(
                                     (StatusCode::INTERNAL_SERVER_ERROR, "Stream error".to_string()).into_response()
                                 });
                         } else {
-                            let stream = resp.bytes_stream();
-                            let body = Body::from_stream(stream);
-                            return Response::builder()
-                                .status(status.as_u16())
-                                .header("content-type", "text/event-stream")
-                                .header("cache-control", "no-cache")
-                                .header("connection", "keep-alive")
-                                .body(body)
-                                .unwrap_or_else(|_| {
-                                    (StatusCode::INTERNAL_SERVER_ERROR, "Stream error".to_string()).into_response()
-                                });
-                        }
-                    } else {
-                        let resp_status = status.as_u16();
-                        let resp_body = resp.text().await.unwrap_or_default();
-
-                        if is_anthropic {
+                            // Non-streaming Anthropic — buffer the SSE stream and build single response
                             tracing::info!(
-                                "[Proxy] Raw upstream body for Anthropic transform ({}B): {}",
-                                resp_body.len(),
-                                &resp_body[..resp_body.len().min(2000)]
+                                "[Proxy] Non-stream Anthropic via SSE buffer for {} ({})",
+                                model, upstream_url,
                             );
-
-                            // Check if upstream returned an error
-                            if resp_status >= 400 {
-                                let error_msg = if let Ok(parsed) = serde_json::from_str::<Value>(&resp_body) {
-                                    parsed.get("error")
-                                        .and_then(|e| e.get("message"))
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("Upstream error")
-                                        .to_string()
-                                } else {
-                                    resp_body.clone()
-                                };
-                                tracing::error!("[Proxy] Upstream error {}: {}", resp_status, &error_msg[..error_msg.len().min(500)]);
-                                return Response::builder()
-                                    .status(resp_status)
-                                    .header("content-type", "application/json")
-                                    .body(Body::from(serde_json::to_string(&json!({
-                                        "type": "error",
-                                        "error": {
-                                            "type": "api_error",
-                                            "message": error_msg
-                                        }
-                                    })).unwrap_or_default()))
-                                    .unwrap_or_else(|_| {
-                                        (StatusCode::INTERNAL_SERVER_ERROR, "Error response").into_response()
-                                    });
-                            }
-
-                            let anthropic_resp = anthropic_bridge::create_anthropic_response(&resp_body, raw_model);
+                            let anthropic_resp = anthropic_bridge::buffer_sse_to_anthropic_response(resp, raw_model).await;
                             return Response::builder()
                                 .status(200)
                                 .header("content-type", "application/json")
@@ -396,15 +358,29 @@ async fn handle_chat_completions(
                                 .unwrap_or_else(|_| {
                                     (StatusCode::INTERNAL_SERVER_ERROR, "Response error".to_string()).into_response()
                                 });
-                        } else {
-                            return Response::builder()
-                                .status(resp_status)
-                                .header("content-type", "application/json")
-                                .body(Body::from(resp_body))
-                                .unwrap_or_else(|_| {
-                                    (StatusCode::INTERNAL_SERVER_ERROR, "Response error".to_string()).into_response()
-                                });
                         }
+                    } else if is_stream {
+                        let stream = resp.bytes_stream();
+                        let body = Body::from_stream(stream);
+                        return Response::builder()
+                            .status(status.as_u16())
+                            .header("content-type", "text/event-stream")
+                            .header("cache-control", "no-cache")
+                            .header("connection", "keep-alive")
+                            .body(body)
+                            .unwrap_or_else(|_| {
+                                (StatusCode::INTERNAL_SERVER_ERROR, "Stream error".to_string()).into_response()
+                            });
+                    } else {
+                        let resp_status = status.as_u16();
+                        let resp_body = resp.text().await.unwrap_or_default();
+                        return Response::builder()
+                            .status(resp_status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(resp_body))
+                            .unwrap_or_else(|_| {
+                                (StatusCode::INTERNAL_SERVER_ERROR, "Response error".to_string()).into_response()
+                            });
                     }
                 }
                 Err(e) => {

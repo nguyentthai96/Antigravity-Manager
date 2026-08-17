@@ -302,4 +302,17 @@ impl TokenManager {
             }
         }
     }
+    /// Mark an account to skip x-goog-user-project header (after 403 SERVICE_DISABLED)
+    pub fn mark_skip_project_header(&self, account_id: &str) {
+        let mut accounts = self.accounts.write();
+        if let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) {
+            if !acc.skip_project_header {
+                tracing::info!(
+                    "[TokenManager] Marking {} to skip project header (403 SERVICE_DISABLED)",
+                    acc.email
+                );
+                acc.skip_project_header = true;
+            }
+        }
+    }
 }

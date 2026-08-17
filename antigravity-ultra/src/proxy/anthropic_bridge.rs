@@ -873,6 +873,177 @@ pub fn create_anthropic_sse_stream(
     axum::body::Body::from_stream(stream)
 }
 
+/// Buffer a Gemini SSE stream and produce a single non-streaming Anthropic response.
+///
+/// This is used when the client requests non-streaming, but we internally use
+/// streamGenerateContent (because generateContent returns 500 for some models).
+pub async fn buffer_sse_to_anthropic_response(
+    upstream_response: reqwest::Response,
+    model: &str,
+) -> Value {
+    let message_id = format!(
+        "msg_{}",
+        &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+    );
+
+    let mut content_blocks: Vec<Value> = Vec::new();
+    let mut stop_reason = "end_turn";
+    let mut has_tool_use = false;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+
+    // Buffers for accumulating text across multiple SSE events
+    let mut current_text = String::new();
+    let mut current_thinking = String::new();
+    let mut line_buffer = String::new();
+
+    let mut byte_stream = upstream_response.bytes_stream();
+
+    while let Some(chunk_result) = byte_stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[AnthropicBridge] Buffer stream error: {}", e);
+                break;
+            }
+        };
+
+        let text = match std::str::from_utf8(&chunk) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        line_buffer.push_str(text);
+
+        // Process complete SSE events
+        loop {
+            let boundary = if let Some(pos) = line_buffer.find("\n\n") {
+                Some((pos, 2))
+            } else if let Some(pos) = line_buffer.find("\r\n\r\n") {
+                Some((pos, 4))
+            } else {
+                None
+            };
+
+            match boundary {
+                Some((pos, sep_len)) => {
+                    let event_text = line_buffer[..pos].to_string();
+                    line_buffer = line_buffer[pos + sep_len..].to_string();
+
+                    for line in event_text.lines() {
+                        let trimmed = line.trim();
+                        if let Some(data) = trimmed.strip_prefix("data:") {
+                            let data = data.trim();
+                            if data.is_empty() || data == "[DONE]" {
+                                continue;
+                            }
+
+                            let parsed: Value = match serde_json::from_str(data) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+
+                            let response_obj = parsed.get("response").unwrap_or(&parsed);
+
+                            // Update usage
+                            if let Some(usage) = response_obj.get("usageMetadata") {
+                                if let Some(v) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+                                    total_input_tokens = v;
+                                }
+                                if let Some(v) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+                                    total_output_tokens = v;
+                                }
+                            }
+
+                            // Process candidates
+                            if let Some(candidates) = response_obj.get("candidates").and_then(|c| c.as_array()) {
+                                for candidate in candidates {
+                                    if let Some(content) = candidate.get("content") {
+                                        if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                                            for part in parts {
+                                                if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                                                    // Thinking part — flush any accumulated text first
+                                                    if !current_text.is_empty() {
+                                                        content_blocks.push(json!({"type": "text", "text": current_text}));
+                                                        current_text.clear();
+                                                    }
+                                                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                                        current_thinking.push_str(t);
+                                                    }
+                                                } else if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                                    // Regular text — flush any accumulated thinking first
+                                                    if !current_thinking.is_empty() {
+                                                        content_blocks.push(json!({"type": "thinking", "thinking": current_thinking}));
+                                                        current_thinking.clear();
+                                                    }
+                                                    current_text.push_str(t);
+                                                } else if let Some(fc) = part.get("functionCall") {
+                                                    // Flush accumulated text/thinking
+                                                    if !current_thinking.is_empty() {
+                                                        content_blocks.push(json!({"type": "thinking", "thinking": current_thinking}));
+                                                        current_thinking.clear();
+                                                    }
+                                                    if !current_text.is_empty() {
+                                                        content_blocks.push(json!({"type": "text", "text": current_text}));
+                                                        current_text.clear();
+                                                    }
+                                                    has_tool_use = true;
+                                                    let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                                                    let args = fc.get("args").cloned().unwrap_or(json!({}));
+                                                    let tool_id = format!("toolu_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
+                                                    content_blocks.push(json!({
+                                                        "type": "tool_use",
+                                                        "id": tool_id,
+                                                        "name": name,
+                                                        "input": args
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(finish) = candidate.get("finishReason").and_then(|f| f.as_str()) {
+                                        stop_reason = match finish {
+                                            "STOP" => {
+                                                if has_tool_use { "tool_use" } else { "end_turn" }
+                                            }
+                                            "MAX_TOKENS" => "max_tokens",
+                                            _ => "end_turn",
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    // Flush remaining accumulated content
+    if !current_thinking.is_empty() {
+        content_blocks.push(json!({"type": "thinking", "thinking": current_thinking}));
+    }
+    if !current_text.is_empty() {
+        content_blocks.push(json!({"type": "text", "text": current_text}));
+    }
+
+    json!({
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content_blocks,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens
+        }
+    })
+}
+
 /// Create a non-streaming Anthropic response from a Gemini response body.
 pub fn create_anthropic_response(gemini_body: &str, model: &str) -> Value {
     let parsed: Value = serde_json::from_str(gemini_body).unwrap_or(json!({}));

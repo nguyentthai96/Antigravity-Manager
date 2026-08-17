@@ -59,6 +59,9 @@ pub struct Account {
     pub proxy_bound_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_label: Option<String>,
+    /// Skip x-goog-user-project header (cached after 403 SERVICE_DISABLED)
+    #[serde(default)]
+    pub skip_project_header: bool,
 }
 
 impl Account {
@@ -87,6 +90,7 @@ impl Account {
             proxy_id: None,
             proxy_bound_at: None,
             custom_label: None,
+            skip_project_header: false,
         }
     }
 
