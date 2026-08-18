@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::pin::Pin;
 
 // ──────────────────────────────────────────────────────────────
@@ -108,7 +109,34 @@ pub fn transform_anthropic_to_gemini(
 ) -> Value {
     let project_id = account.token.project_id.as_deref().unwrap_or("");
 
-    // 1. Convert messages to Gemini contents
+    // 1. First pass: build tool_use_id → function_name map from all messages.
+    //    Gemini requires functionResponse.name to be the actual function name,
+    //    not the Anthropic tool_use_id. We scan assistant messages for tool_use
+    //    blocks to build this mapping before converting any messages.
+    let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                if let Some(Value::Array(blocks)) = msg.get("content") {
+                    for block in blocks {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            if let (Some(id), Some(name)) = (
+                                block.get("id").and_then(|i| i.as_str()),
+                                block.get("name").and_then(|n| n.as_str()),
+                            ) {
+                                tool_id_to_name.insert(id.to_string(), name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !tool_id_to_name.is_empty() {
+        tracing::info!("[AnthropicBridge] Built tool_id→name map: {:?}", tool_id_to_name);
+    }
+
+    // 2. Convert messages to Gemini contents
     let mut contents: Vec<Value> = Vec::new();
 
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
@@ -119,7 +147,7 @@ pub fn transform_anthropic_to_gemini(
                 _ => "user",
             };
 
-            let parts = extract_parts_from_anthropic_message(msg);
+            let parts = extract_parts_from_anthropic_message(msg, &tool_id_to_name);
             if !parts.is_empty() {
                 contents.push(json!({
                     "role": gemini_role,
@@ -237,7 +265,7 @@ pub fn transform_anthropic_to_gemini(
 ///   - A string: `"content": "Hello"` (simple text)
 ///   - An array of content blocks: `"content": [{"type": "text", "text": "..."}, {"type": "tool_use", ...}]`
 ///   - An array with tool_result blocks (from user role): `[{"type": "tool_result", ...}]`
-fn extract_parts_from_anthropic_message(msg: &Value) -> Vec<Value> {
+fn extract_parts_from_anthropic_message(msg: &Value, tool_id_to_name: &HashMap<String, String>) -> Vec<Value> {
     let mut parts = Vec::new();
 
     match msg.get("content") {
@@ -250,7 +278,12 @@ fn extract_parts_from_anthropic_message(msg: &Value) -> Vec<Value> {
                 match block_type {
                     "text" => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            parts.push(json!({"text": text}));
+                            // Skip empty text blocks — they cause upstream errors
+                            // (e.g. "messages.1.content.2.text.text: Field required")
+                            // because cloudcode can't reconstruct them properly.
+                            if !text.is_empty() {
+                                parts.push(json!({"text": text}));
+                            }
                         }
                     }
                     "thinking" => {
@@ -263,18 +296,38 @@ fn extract_parts_from_anthropic_message(msg: &Value) -> Vec<Value> {
                     "tool_use" => {
                         // Assistant requesting tool use
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
                         let input = block.get("input").cloned().unwrap_or(json!({}));
-                        parts.push(json!({
+                        // Include "id" so upstream cloudcode can reconstruct the
+                        // Anthropic tool_use.id field (required for multi-turn).
+                        let mut fc = json!({
                             "functionCall": {
                                 "name": name,
                                 "args": input
                             }
-                        }));
+                        });
+                        if !id.is_empty() {
+                            fc["functionCall"]["id"] = json!(id);
+                        }
+                        parts.push(fc);
                     }
                     "tool_result" => {
                         // User providing tool results
                         let tool_use_id =
                             block.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("");
+                        // CRITICAL: Gemini requires functionResponse.name to be the
+                        // actual function name (e.g. "list_dir"), NOT the Anthropic
+                        // tool_use_id (e.g. "toolu_xxxx"). Look up from the map we built.
+                        let function_name = tool_id_to_name
+                            .get(tool_use_id)
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    "[AnthropicBridge] tool_use_id '{}' not found in tool_id→name map, using as-is",
+                                    tool_use_id
+                                );
+                                tool_use_id
+                            });
                         let content = match block.get("content") {
                             Some(Value::String(s)) => s.clone(),
                             Some(Value::Array(arr)) => {
@@ -296,9 +349,14 @@ fn extract_parts_from_anthropic_message(msg: &Value) -> Vec<Value> {
                             .get("is_error")
                             .and_then(|e| e.as_bool())
                             .unwrap_or(false);
+                        tracing::debug!(
+                            "[AnthropicBridge] tool_result: id='{}' → name='{}', content_len={}, is_error={}",
+                            tool_use_id, function_name, content.len(), is_error
+                        );
                         parts.push(json!({
                             "functionResponse": {
-                                "name": tool_use_id,
+                                "name": function_name,
+                                "id": tool_use_id,
                                 "response": {
                                     "result": content,
                                     "error": is_error
@@ -660,6 +718,10 @@ impl AnthropicSseConverter {
     fn process_gemini_event(&mut self, data_json: &str) -> Vec<String> {
         let mut events = Vec::new();
 
+        // Log raw Gemini SSE data for debugging
+        let preview_len = data_json.len().min(500);
+        tracing::debug!("[AnthropicBridge] Raw Gemini SSE ({} bytes): {}", data_json.len(), &data_json[..preview_len]);
+
         let parsed: Value = match serde_json::from_str(data_json) {
             Ok(v) => v,
             Err(e) => {
@@ -670,6 +732,21 @@ impl AnthropicSseConverter {
 
         // Unwrap response wrapper if present
         let response_obj = parsed.get("response").unwrap_or(&parsed);
+
+        // Log key fields for debugging
+        let has_candidates = response_obj.get("candidates").is_some();
+        let has_usage = response_obj.get("usageMetadata").is_some();
+        let finish_reason = response_obj
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("finishReason"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("none");
+        tracing::info!(
+            "[AnthropicBridge] Gemini event: candidates={}, usage={}, finish={}, started={}, content_index={}",
+            has_candidates, has_usage, finish_reason, self.started, self.content_index
+        );
 
         // Extract usage metadata
         if let Some(usage) = response_obj.get("usageMetadata") {
@@ -779,6 +856,7 @@ impl AnthropicSseConverter {
             Err(_) => return Vec::new(),
         };
 
+        tracing::debug!("[AnthropicBridge] Raw chunk ({} bytes): {}...", chunk.len(), &text[..text.len().min(200)]);
         self.line_buffer.push_str(text);
 
         let mut events = Vec::new();
@@ -832,10 +910,18 @@ pub fn create_anthropic_sse_stream(
     let stream = async_stream::stream! {
         let mut converter = AnthropicSseConverter::new(&model);
         let mut byte_stream = upstream_response.bytes_stream();
+        let mut total_bytes: usize = 0;
+        let mut chunk_count: usize = 0;
 
         while let Some(chunk_result) = byte_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
+                    chunk_count += 1;
+                    total_bytes += chunk.len();
+                    tracing::info!(
+                        "[AnthropicBridge] Chunk #{}: {} bytes (total: {} bytes)",
+                        chunk_count, chunk.len(), total_bytes
+                    );
                     let events = converter.process_chunk(&chunk);
                     for event in events {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
@@ -854,9 +940,54 @@ pub fn create_anthropic_sse_stream(
             }
         }
 
-        // Ensure message_stop is sent if stream ends without finishReason
-        if converter.started && converter.content_index == 0 {
-            // Stream ended without any content — emit minimal valid response
+        tracing::info!(
+            "[AnthropicBridge] Stream ended: {} chunks, {} total bytes, started={}, content_index={}, has_tool_use={}",
+            chunk_count, total_bytes, converter.started, converter.content_index, converter.has_tool_use
+        );
+
+        // ── Post-stream finalizer ─────────────────────────────────
+        // Ensure message_stop is ALWAYS sent when the SSE stream ends.
+        // The Anthropic SDK's get_final_message() asserts that the
+        // internal __final_message_snapshot is not None, which requires
+        // at least message_start to have been processed. And the SDK
+        // expects the sequence to end with message_delta + message_stop.
+        //
+        // Three cases:
+        //   A) converter never started → emit full minimal response
+        //   B) converter started, has open content block → close it + stop
+        //   C) converter started, content properly closed but no stop → emit stop
+        if !converter.started {
+            // Case A: Gemini returned nothing parseable — emit minimal valid response
+            tracing::warn!(
+                "[AnthropicBridge] CASE A: Stream ended with NO parseable events (0 Gemini events). Emitting empty minimal response."
+            );
+            let events = vec![
+                converter.message_start(0),
+                converter.ping(),
+                converter.text_block_start(),
+                converter.text_delta(""),
+                converter.content_block_stop(),
+                converter.message_delta("end_turn", 0),
+                converter.message_stop(),
+            ];
+            for event in events {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
+            }
+        } else if converter.current_block_type.is_some() {
+            // Case B: Stream ended with an open content block (no finishReason from Gemini)
+            tracing::info!("[AnthropicBridge] CASE B: Closing open content block");
+            let stop_reason = if converter.has_tool_use { "tool_use" } else { "end_turn" };
+            let events = vec![
+                converter.content_block_stop(),
+                converter.message_delta(stop_reason, converter.total_output_tokens),
+                converter.message_stop(),
+            ];
+            for event in events {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
+            }
+        } else if converter.content_index == 0 {
+            // Case C-1: Started but no content blocks at all — emit minimal content + stop
+            tracing::info!("[AnthropicBridge] CASE C-1: No content blocks");
             let events = vec![
                 converter.text_block_start(),
                 converter.text_delta(""),
@@ -867,7 +998,12 @@ pub fn create_anthropic_sse_stream(
             for event in events {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(event));
             }
+        } else {
+            tracing::info!("[AnthropicBridge] CASE C-2: Stream properly terminated");
         }
+        // Case C-2: content_index > 0 && current_block_type is None && started
+        // This means finishReason was already processed (which emits message_delta + message_stop)
+        // so no action needed — the stream is already properly terminated.
     };
 
     axum::body::Body::from_stream(stream)
@@ -898,6 +1034,8 @@ pub async fn buffer_sse_to_anthropic_response(
     let mut line_buffer = String::new();
 
     let mut byte_stream = upstream_response.bytes_stream();
+    let mut chunk_count: usize = 0;
+    let mut total_bytes: usize = 0;
 
     while let Some(chunk_result) = byte_stream.next().await {
         let chunk = match chunk_result {
@@ -912,6 +1050,13 @@ pub async fn buffer_sse_to_anthropic_response(
             Ok(s) => s,
             Err(_) => continue,
         };
+
+        chunk_count += 1;
+        total_bytes += chunk.len();
+        tracing::info!(
+            "[AnthropicBridge/Buffer] Chunk #{}: {} bytes. Data: {}...",
+            chunk_count, chunk.len(), &text[..text.len().min(300)]
+        );
 
         line_buffer.push_str(text);
 
