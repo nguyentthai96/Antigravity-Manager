@@ -165,7 +165,40 @@ async fn handle_chat_completions(
         }
     }
 
-    // 2. Get next available token from pool
+    // 2. Parse request body (before account loop — only needs to happen once)
+    let body_json: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"message": format!("Invalid JSON: {}", e)}})),
+            )
+                .into_response();
+        }
+    };
+
+    let raw_model = body_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("gemini-2.0-flash");
+    let model = map_model_name(raw_model);
+
+    let is_anthropic = anthropic_bridge::is_anthropic_format(&body_json, &headers);
+    let is_stream = if is_anthropic {
+        anthropic_bridge::detect_stream(&body_json, &headers)
+    } else {
+        body_json
+            .get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false)
+    };
+    let is_claude = model.to_lowercase().contains("claude");
+
+    // 3. Account retry loop — try different accounts when 429'd
+    let max_account_retries = 3u8;
+    let mut tried_account_ids: Vec<String> = Vec::new();
+
+    for account_attempt in 0..max_account_retries {
     let account = match state.token_manager.get_next_account().await {
         Some(acc) => acc,
         None => {
@@ -182,44 +215,22 @@ async fn handle_chat_completions(
         }
     };
 
-    tracing::info!(
-        "[Proxy] Routing request from {} to account {}",
-        client_ip,
-        account.email
-    );
-
-    // 3. Parse request body
-    let body_json: Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": {"message": format!("Invalid JSON: {}", e)}})),
-            )
-                .into_response();
+    // Skip accounts we already tried (429'd)
+    if tried_account_ids.contains(&account.id) {
+        if account_attempt < max_account_retries - 1 {
+            tracing::info!("[Proxy] Skipping already-tried account {} — trying next", account.email);
+            continue;
         }
-    };
+    }
+    tried_account_ids.push(account.id.clone());
 
-    let raw_model = body_json
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("gemini-2.0-flash");
-
-    // Map model name to v1internal-compatible name (matches Tauri CLAUDE_TO_GEMINI table)
-    let model = map_model_name(raw_model);
-
-    // 4. Detect protocol format (Anthropic vs OpenAI)
-    let is_anthropic = anthropic_bridge::is_anthropic_format(&body_json, &headers);
-    let is_stream = if is_anthropic {
-        anthropic_bridge::detect_stream(&body_json, &headers)
-    } else {
-        body_json
-            .get("stream")
-            .and_then(|s| s.as_bool())
-            .unwrap_or(false)
-    };
-
-    let is_claude = model.to_lowercase().contains("claude");
+    tracing::info!(
+        "[Proxy] Routing request from {} to account {} (attempt {}/{})",
+        client_ip,
+        account.email,
+        account_attempt + 1,
+        max_account_retries,
+    );
 
     tracing::info!(
         "[Proxy] Protocol: {}, Stream: {}, Model: {} (raw: {}), Claude: {}",
@@ -250,6 +261,13 @@ async fn handle_chat_completions(
     let http_client = crate::utils::http::get_streaming_client();
     let body_str = serde_json::to_string(&gemini_body).unwrap_or_default();
 
+    // Debug: log request body being sent to Gemini
+    tracing::info!(
+        "[Proxy] Gemini request body ({} bytes): {}...",
+        body_str.len(),
+        &body_str[..body_str.len().min(1000)]
+    );
+
     // 7. Try endpoints with fallback (Sandbox → Daily → Prod)
     // Use cached skip_project_header from account (persisted after first 403 SERVICE_DISABLED)
     let mut skip_project_header = account.skip_project_header;
@@ -257,7 +275,10 @@ async fn handle_chat_completions(
     // If already cached, skip directly to pass 1 behavior
     let start_pass: u8 = if skip_project_header { 1 } else { 0 };
 
+    let mut all_429 = true; // Track if ALL endpoints returned 429
+
     for pass in start_pass..2u8 {
+        all_429 = true; // Reset per pass
         for base_url in &V1_INTERNAL_URLS {
             let upstream_url = if let Some(qs) = query_string {
                 format!("{}:{}?{}", base_url, method_name, qs)
@@ -303,16 +324,19 @@ async fn handle_chat_completions(
                             skip_project_header = true;
                             // Persist the flag so future requests skip immediately
                             state.token_manager.mark_skip_project_header(&account.id);
+                            // Don't set all_429=false here — pass 1 will reset it
                             break; // Break inner loop, trigger pass 1
                         }
                         // Other 403 errors — try next endpoint
                         tracing::warn!("[Proxy] Endpoint {} returned 403 — trying next", upstream_url);
+                        all_429 = false;
                         continue;
                     }
 
                     // Handle 403 on pass 2 (already without project header) — try next endpoint
                     if status.as_u16() == 403 {
                         tracing::warn!("[Proxy] Endpoint {} returned 403 (no project header) — trying next", upstream_url);
+                        all_429 = false;
                         continue;
                     }
 
@@ -323,10 +347,36 @@ async fn handle_chat_completions(
                             "[Proxy] Endpoint {} returned {} — trying next fallback",
                             upstream_url, status
                         );
+                        all_429 = false;
+                        continue;
+                    }
+
+                    // Handle 429 Too Many Requests — rate limited, try next endpoint
+                    if status.as_u16() == 429 {
+                        let err_body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            "[Proxy] 429 RATE LIMITED on {} (account: {}) — body: {}... Trying next endpoint.",
+                            upstream_url, account.email, &err_body[..err_body.len().min(300)]
+                        );
+                        // all_429 stays true
                         continue;
                     }
 
                     // ─── SUCCESS: Build response based on protocol ───
+                    // Log upstream response details
+                    let resp_content_type = resp.headers().get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let resp_content_length = resp.headers().get("content-length")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("chunked")
+                        .to_string();
+                    tracing::info!(
+                        "[Proxy] Upstream response: status={}, content-type={}, content-length={}",
+                        status, resp_content_type, resp_content_length
+                    );
+
                     if is_anthropic {
                         if is_stream {
                             // Streaming Anthropic — forward SSE stream directly
@@ -385,6 +435,7 @@ async fn handle_chat_completions(
                 }
                 Err(e) => {
                     tracing::warn!("[Proxy] Endpoint {} connection error: {} — trying next", upstream_url, e);
+                    all_429 = false;
                     continue;
                 }
             }
@@ -398,8 +449,21 @@ async fn handle_chat_completions(
         break;
     }
 
-    // All endpoints exhausted
-    tracing::error!("[Proxy] All upstream endpoints failed");
+    // If all endpoints returned 429, try next account
+    if all_429 && account_attempt < max_account_retries - 1 {
+        tracing::warn!(
+            "[Proxy] All endpoints returned 429 for account {} — retrying with different account",
+            account.email
+        );
+        continue; // Next iteration of account retry loop
+    }
+
+    // If we get here, all endpoints exhausted for this account (non-429 failures)
+    break;
+    } // end account retry loop
+
+    // All endpoints and accounts exhausted
+    tracing::error!("[Proxy] All upstream endpoints failed (tried {} accounts)", tried_account_ids.len());
 
     if is_anthropic {
         (
