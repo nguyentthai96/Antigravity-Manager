@@ -316,7 +316,8 @@ async fn handle_chat_completions(
                     // Handle 403 → on first pass, trigger retry without project header
                     if status.as_u16() == 403 && !skip_project_header {
                         let err_body = resp.text().await.unwrap_or_default();
-                        if err_body.contains("SERVICE_DISABLED") || err_body.contains("has not been used") {
+                        tracing::warn!("[Proxy] 403 body: {}", err_body);
+                        if err_body.contains("SERVICE_DISABLED") || err_body.contains("has not been used") || err_body.contains("USER_PROJECT_DENIED") {
                             tracing::warn!(
                                 "[Proxy] 403 SERVICE_DISABLED — caching skip for {} and retrying",
                                 account.email
@@ -335,6 +336,8 @@ async fn handle_chat_completions(
 
                     // Handle 403 on pass 2 (already without project header) — try next endpoint
                     if status.as_u16() == 403 {
+                        let err_body = resp.text().await.unwrap_or_default();
+                        tracing::warn!("[Proxy] 403 body (pass 2): {}", err_body);
                         tracing::warn!("[Proxy] Endpoint {} returned 403 (no project header) — trying next", upstream_url);
                         all_429 = false;
                         continue;
