@@ -14,12 +14,11 @@ pub use collector::collect_stream_to_json;
 pub use models::*;
 pub use request::{
     clean_cache_control_from_messages, merge_consecutive_messages, transform_claude_request_in,
+    transform_claude_request_in_timed,
 };
 pub use response::transform_response;
 pub use streaming::{PartProcessor, StreamingState};
-pub use thinking_utils::{
-    close_tool_loop_for_thinking, filter_invalid_thinking_blocks_with_family,
-}; // [NEW]
+pub use thinking_utils::filter_invalid_thinking_blocks_with_family; // [NEW]
 
 use bytes::Bytes;
 use futures::Stream;
@@ -56,50 +55,111 @@ where
         state.set_client_adapter(client_adapter); // [NEW] Set adapter
         state.set_registered_tool_names(registered_tool_names); // [FIX #MCP] Set tool names
         let mut buffer = BytesMut::new();
+        // [FIX #Bug1] Track consecutive ping timeouts to detect stuck streams
+        let mut consecutive_pings: u32 = 0;
+        const MAX_CONSECUTIVE_PINGS: u32 = 5; // 5 × 20s = 100s max idle before giving up
 
         loop {
-            // [NEW] 60秒心跳保活: 延长超时时间以增加网络抖动容错
+            // [FIX #Bug1] Reduced from 60s to 20s: faster fail-fast on idle streams.
+            // Gemini normally sends data within 5s; 20s is generous without causing 60s delays.
             let next_chunk = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(20),
                 gemini_stream.next()
             ).await;
 
             match next_chunk {
                 Ok(Some(chunk_result)) => {
+                    // Reset ping counter on any real data
+                    consecutive_pings = 0;
                     match chunk_result {
                         Ok(chunk) => {
                             buffer.extend_from_slice(&chunk);
 
-                            // Process complete lines
                             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                                 let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
-                                    if line.is_empty() { continue; }
+                                let line_str = String::from_utf8_lossy(&line_raw);
+                                let line = line_str.trim();
+                                if line.is_empty() { continue; }
 
-                                    if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                                        for sse_chunk in sse_chunks {
-                                            yield Ok(sse_chunk);
-                                        }
+                                if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                                    for sse_chunk in sse_chunks {
+                                        yield Ok(sse_chunk);
                                     }
                                 }
                             }
                         }
                         Err(e) => {
+                            let session = state
+                                .session_id
+                                .clone()
+                                .unwrap_or_else(|| "-".to_string());
+                            let report = crate::proxy::mappers::error_classifier::report_stream_error(
+                                "claude",
+                                "create_claude_sse_stream",
+                                &e,
+                                format!(
+                                    "trace={} session={} messages={} buffer_bytes={}",
+                                    trace_id,
+                                    session,
+                                    message_count,
+                                    buffer.len()
+                                ),
+                            );
                             let error_json = serde_json::json!({
+                                "type": "error",
                                 "error": {
-                                    "message": format!("Stream error: {}", e),
-                                    "type": "stream_error"
+                                    "type": report.classified.error_type,
+                                    "message": report.client_message(),
+                                    "function": report.function,
+                                    "call_site": report.call_site(),
+                                    "params": report.params,
                                 }
                             });
-                            yield Ok(Bytes::from(format!("data: {}\n\n", error_json)));
+                            yield Ok(state.emit("error", error_json));
                             break;
                         }
                     }
                 }
                 Ok(None) => break, // Stream 正常结束
                 Err(_) => {
-                    // 超时，发送心跳包 (SSE Comment 格式)
+                    // [FIX #Bug1] Timeout - send keepalive ping but track consecutive count
+                    consecutive_pings += 1;
+                    if consecutive_pings >= MAX_CONSECUTIVE_PINGS {
+                        let idle_secs = consecutive_pings * 20;
+                        let session = state
+                            .session_id
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string());
+                        let report = crate::proxy::mappers::error_classifier::report_stream_error(
+                            "claude",
+                            "create_claude_sse_stream",
+                            &"stream idle timeout",
+                            format!(
+                                "trace={} session={} messages={} idle_secs={} consecutive_pings={}",
+                                trace_id,
+                                session,
+                                message_count,
+                                idle_secs,
+                                consecutive_pings
+                            ),
+                        );
+                        let error_json = serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": report.classified.error_type,
+                                "message": report.client_message(),
+                                "function": report.function,
+                                "call_site": report.call_site(),
+                                "params": report.params,
+                            }
+                        });
+                        yield Ok(state.emit("error", error_json));
+                        break;
+                    }
+                    tracing::debug!(
+                        "[{}] SSE idle ping #{}/{}",
+                        trace_id, consecutive_pings, MAX_CONSECUTIVE_PINGS
+                    );
                     yield Ok(Bytes::from(": ping\n\n"));
                 }
             }
@@ -108,23 +168,22 @@ where
         // [FIX #1732] Mandatory Flush remaining buffer on stream termination
         // Prevents hangs when the last SSE chunk doesn't end with a newline (network fragmentation)
         if !buffer.is_empty() {
-             if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                 let line = line_str.trim();
-                 if !line.is_empty() {
-                     tracing::debug!("[{}] SSE Termination: Flushing remaining {} bytes in buffer", trace_id, buffer.len());
-                     if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                         for sse_chunk in sse_chunks {
-                             yield Ok(sse_chunk);
-                         }
+             let line_str = String::from_utf8_lossy(&buffer);
+             let line = line_str.trim();
+             if !line.is_empty() {
+                 tracing::debug!("[{}] SSE Termination: Flushing remaining {} bytes in buffer", trace_id, buffer.len());
+                 if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                     for sse_chunk in sse_chunks {
+                         yield Ok(sse_chunk);
                      }
                  }
              }
              buffer.clear();
         }
 
-        // [FIX #859] Post-thinking interruption recovery
-        // If we have sent thinking but NO content (text/tool_use) and the stream ended (or timed out without DONE),
-        // we must provide a fallback to prevent 0-token errors on client side.
+        // [FIX #Bug3] Post-thinking interruption recovery
+        // If we have sent thinking but NO content (text/tool_use) and the stream ended,
+        // we must provide a fallback to prevent loop hang on client side.
         if state.has_thinking && !state.has_content {
             tracing::warn!("[{}] Stream interrupted after thinking (No Content). Triggering recovery...", trace_id);
 
@@ -136,38 +195,83 @@ where
                }
             }
 
-            // 2. Inject system message to inform user
-            // We use a new text block for this.
+            // 2. Inject recovery text block to inform user
             let recovery_msg = "\n\n[System] Upstream model interrupted after thinking. (Recovered by Antigravity)";
             let start_chunks = state.start_block(
                 crate::proxy::mappers::claude::streaming::BlockType::Text,
                 serde_json::json!({ "type": "text", "text": recovery_msg })
             );
             for chunk in start_chunks { yield Ok(chunk); }
-
             let stop_chunks = state.end_block();
             for chunk in stop_chunks { yield Ok(chunk); }
 
-            // 3. Mark as content received so we don't trigger this again (though loop is done)
+            // 3. Mark as content received
             state.has_content = true;
 
-            // 4. Send a simulated usage update to ensure we have > 0 output tokens
-            // Estimate based on some default if we didn't get any usage
+            // 4. [FIX #Bug3] Explicitly emit message_delta + message_stop.
+            // Previously, the recovery path relied on emit_force_stop() below,
+            // but if message_stop_sent was already true (e.g. from a partial finish),
+            // emit_force_stop() would be a no-op and the client would hang in loop.
+            if !state.message_stop_sent {
+                let recovery_usage = crate::proxy::mappers::claude::models::Usage {
+                    input_tokens: 0,
+                    output_tokens: 100, // Minimal non-zero to satisfy client
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    server_tool_use: None,
+                };
+                let delta = serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                    "usage": recovery_usage
+                });
+                yield Ok(state.emit("message_delta", delta));
+                yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+                state.message_stop_sent = true;
+            }
+        } else if !state.has_content && !state.has_thinking {
+            // [FIX #3359] Empty response recovery (e.g. single dot prompt health check)
+            // If the upstream ended immediately without generating thinking or text content,
+            // we must ensure message_start and at least one text block are sent before termination.
+            if !state.message_start_sent {
+                let dummy_start = serde_json::json!({
+                    "responseId": format!("msg_recovered_{}", chrono::Utc::now().timestamp_millis()),
+                    "modelVersion": "gemini-auto",
+                });
+                yield Ok(state.emit_message_start(&dummy_start));
+            }
+
+            let start_chunks = state.start_block(
+                crate::proxy::mappers::claude::streaming::BlockType::Text,
+                serde_json::json!({ "type": "text", "text": "." }),
+            );
+            for chunk in start_chunks {
+                yield Ok(chunk);
+            }
+            let stop_chunks = state.end_block();
+            for chunk in stop_chunks {
+                yield Ok(chunk);
+            }
+            state.has_content = true;
+
             let recovery_usage = crate::proxy::mappers::claude::models::Usage {
-                input_tokens: 0, // We don't know input, but output is critical
-                output_tokens: 100, // Arbitrary small number to satisfy client
+                input_tokens: 1,
+                output_tokens: 1,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 server_tool_use: None,
             };
-
             let delta = serde_json::json!({
                 "type": "message_delta",
                 "delta": { "stop_reason": "end_turn", "stop_sequence": null },
                 "usage": recovery_usage
             });
-
             yield Ok(state.emit("message_delta", delta));
+        }
+
+        if let Some(sid) = state.session_id.clone() {
+            let acc = std::mem::take(&mut state.thinking_acc);
+            acc.commit(&sid);
         }
 
         // Ensure termination events are sent
@@ -252,6 +356,7 @@ fn process_sse_line(
         .and_then(|p| p.as_array())
     {
         for part_value in parts {
+            state.thinking_acc.ingest_part(part_value);
             if let Ok(part) = serde_json::from_value::<GeminiPart>(part_value.clone()) {
                 let mut processor = PartProcessor::new(state);
                 chunks.extend(processor.process(&part));

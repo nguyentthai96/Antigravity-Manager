@@ -1,6 +1,8 @@
 
 
 import {
+  Calendar,
+  Clock,
   Download,
   LayoutGrid,
   List,
@@ -25,7 +27,7 @@ import { showToast } from "../components/common/ToastContainer";
 import { exportAccounts } from "../services/accountService";
 import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
-import { Account } from "../types/account";
+import { Account, getAccountTier } from "../types/account";
 import { cn } from "../utils/cn";
 import { isTauri } from "../utils/env";
 import { request as invoke } from "../utils/request";
@@ -33,6 +35,7 @@ import { useTranslation } from "react-i18next";
 
 type FilterType = "all" | "pro" | "ultra" | "free";
 type ViewMode = "list" | "grid";
+export type QuotaWindow = "5h" | "weekly";
 
 
 function Accounts() {
@@ -41,6 +44,7 @@ function Accounts() {
     accounts,
     currentAccount,
     fetchAccounts,
+    fetchCurrentAccount,
     addAccount,
     deleteAccount,
     deleteAccounts,
@@ -52,6 +56,7 @@ function Accounts() {
     warmUpAccounts,
     warmUpAccount,
     updateAccountLabel,
+    updateAccountPriority,
   } = useAccountStore();
   const { config, showAllQuotas, toggleShowAllQuotas } = useConfigStore();
 
@@ -64,10 +69,20 @@ function Accounts() {
     return (saved === 'list' || saved === 'grid') ? saved : 'list';
   });
 
+  const [quotaWindow, setQuotaWindow] = useState<QuotaWindow>(() => {
+    const saved = localStorage.getItem('accounts_quota_window');
+    return (saved === '5h' || saved === 'weekly') ? saved : '5h';
+  });
+
   // Save view mode preference
   useEffect(() => {
     localStorage.setItem('accounts_view_mode', viewMode);
   }, [viewMode]);
+
+  // Save quota window preference
+  useEffect(() => {
+    localStorage.setItem('accounts_quota_window', quotaWindow);
+  }, [quotaWindow]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deviceAccount, setDeviceAccount] = useState<Account | null>(null);
   const [detailsAccount, setDetailsAccount] = useState<Account | null>(null);
@@ -226,7 +241,8 @@ function Accounts() {
 
   useEffect(() => {
     fetchAccounts();
-  }, []);
+    fetchCurrentAccount();
+  }, [fetchAccounts, fetchCurrentAccount]);
 
   // Reset pagination when view mode changes to avoid empty pages or confusion
   useEffect(() => {
@@ -244,39 +260,16 @@ function Accounts() {
   const filterCounts = useMemo(() => {
     return {
       all: searchedAccounts.length,
-      pro: searchedAccounts.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("pro"),
-      ).length,
-      ultra: searchedAccounts.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("ultra"),
-      ).length,
-      free: searchedAccounts.filter((a) => {
-        const tier = a.quota?.subscription_tier?.toLowerCase();
-        return tier && !tier.includes("pro") && !tier.includes("ultra");
-      }).length,
+      pro: searchedAccounts.filter((a) => getAccountTier(a) === "pro").length,
+      ultra: searchedAccounts.filter((a) => getAccountTier(a) === "ultra").length,
+      free: searchedAccounts.filter((a) => getAccountTier(a) === "free").length,
     };
   }, [searchedAccounts]);
 
   // 过滤和搜索最终结果
   const filteredAccounts = useMemo(() => {
-    let result = searchedAccounts;
-
-    if (filter === "pro") {
-      result = result.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("pro"),
-      );
-    } else if (filter === "ultra") {
-      result = result.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("ultra"),
-      );
-    } else if (filter === "free") {
-      result = result.filter((a) => {
-        const tier = a.quota?.subscription_tier?.toLowerCase();
-        return tier && !tier.includes("pro") && !tier.includes("ultra");
-      });
-    }
-
-    return result;
+    if (filter === "all") return searchedAccounts;
+    return searchedAccounts.filter((a) => getAccountTier(a) === filter);
   }, [searchedAccounts, filter]);
 
   // Pagination Logic
@@ -791,6 +784,36 @@ function Accounts() {
           )}
         </div>
 
+        {/* 配额周期切换 (5H / 7天周配额) */}
+        <div className="flex gap-1 bg-gray-100 dark:bg-base-200 p-1 rounded-lg shrink-0 items-center">
+          <button
+            className={cn(
+              "px-2 py-1 text-xs font-semibold rounded-md transition-all flex items-center gap-1",
+              quotaWindow === "5h"
+                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm"
+                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
+            )}
+            onClick={() => setQuotaWindow("5h")}
+            title={t("accounts.quota_window_5h", "5小时滑动配额")}
+          >
+            <Clock className="w-3.5 h-3.5" />
+            <span>5H</span>
+          </button>
+          <button
+            className={cn(
+              "px-2 py-1 text-xs font-semibold rounded-md transition-all flex items-center gap-1",
+              quotaWindow === "weekly"
+                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm"
+                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
+            )}
+            onClick={() => setQuotaWindow("weekly")}
+            title={t("accounts.quota_window_weekly", "7天周配额")}
+          >
+            <Calendar className="w-3.5 h-3.5" />
+            <span>{t("accounts.quota_window_weekly_short", "周配额")}</span>
+          </button>
+        </div>
+
         {/* 视图切换按钮组 */}
         <div className="flex gap-1 bg-gray-100 dark:bg-base-200 p-1 rounded-lg shrink-0">
           <button
@@ -1077,6 +1100,7 @@ function Accounts() {
                 onWarmup={handleWarmup}
                 onUpdateLabel={handleUpdateLabel}
                 onViewError={(id: string) => setErrorAccountId(id)}
+                quotaWindow={quotaWindow}
               />
             </div>
           </div>
@@ -1104,6 +1128,7 @@ function Accounts() {
               onWarmup={handleWarmup}
               onUpdateLabel={handleUpdateLabel}
               onViewError={(id: string) => setErrorAccountId(id)}
+              quotaWindow={quotaWindow}
             />
           </div>
         )}
@@ -1128,8 +1153,9 @@ function Accounts() {
       )}
 
       <AccountDetailsDialog
-        account={detailsAccount}
+        account={accounts.find(a => a.id === detailsAccount?.id) || null}
         onClose={() => setDetailsAccount(null)}
+        onUpdatePriority={updateAccountPriority}
       />
       <DeviceFingerprintDialog
         account={deviceAccount}
@@ -1221,12 +1247,6 @@ function Accounts() {
         isDestructive={false}
         onConfirm={handleWarmupAll}
         onCancel={() => setIsWarmupConfirmOpen(false)}
-      />
-
-      {/* 账号详情弹窗 */}
-      <AccountDetailsDialog
-        account={detailsAccount}
-        onClose={() => setDetailsAccount(null)}
       />
 
       {/* 账号错误详情弹窗 */}

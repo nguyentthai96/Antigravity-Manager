@@ -2,6 +2,20 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Override dark background utilities so enabled switches remain distinct. */
+.dark input.toggle[type="checkbox"]:checked {
+  background-color: var(--app-toggle-active, #3b82f6);
+  border-color: var(--app-toggle-active, #3b82f6);
+}
+
+.dark input.toggle[type="checkbox"]:checked::before {
+  background-color: #ffffff;
+}
+
+.dark input.toggle.toggle-success { --app-toggle-active: #16a34a; }
+.dark input.toggle.toggle-warning { --app-toggle-active: #d97706; }
+.dark input.toggle.toggle-error { --app-toggle-active: #dc2626; }
+
 /* 禁止过度滚动和橡皮筋效果 */
 html,
 body {
@@ -19,7 +33,7 @@ html {
 }
 
 html.dark {
-  background-color: #1d232a;
+  background-color: #0f172a;
 }
 
 /* 全局样式 */
@@ -30,13 +44,25 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   background-color: #FAFBFC;
+}
+
+/* LobeHub UI flex center fallback for @lobehub/icons avatar components */
+.lobe-flex {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  line-height: 0 !important;
+}
+.lobe-flex svg {
+  display: block;
 }
 
 /* Dark mode override for body strictly */
 .dark body {
-  background-color: #1d232a;
-  /* matches base-300 commonly used */
+  background-color: #0f172a;
+  color: #f8fafc;
 }
 
 #root {
@@ -77,6 +103,47 @@ a {
 
 ::-webkit-scrollbar-thumb:hover {
   background-color: rgba(0, 0, 0, 0.3);
+}
+
+/* 日志报文虚拟滚动条 - 高性能高对比度响应式滚动条 */
+.payload-viewer-scroll {
+  scroll-behavior: auto !important;
+  overflow-anchor: none;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(156, 163, 175, 0.5) transparent;
+}
+
+.payload-viewer-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.payload-viewer-scroll::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+.payload-viewer-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.45);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  transition: background-color 0.15s;
+}
+
+.payload-viewer-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(107, 114, 128, 0.75);
+}
+
+.dark .payload-viewer-scroll {
+  scrollbar-color: rgba(148, 163, 184, 0.4) transparent;
+}
+
+.dark .payload-viewer-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.4);
+}
+
+.dark .payload-viewer-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(148, 163, 184, 0.7);
 }
 
 /* View Transitions API 主题切换动画 */

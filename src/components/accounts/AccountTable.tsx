@@ -45,13 +45,17 @@ import {
     Bot,
     Repeat2,
     Terminal,
+    ArrowUpDown,
+    ArrowUp,
+    ArrowDown,
 } from 'lucide-react';
-import type { Account, ModelQuota } from '../../types/account';
+import { type Account, type ModelQuota, getAccountTier } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
 import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
+import { getModelQuotaDisplay } from '../../utils/quotaDisplay';
 import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
 import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
@@ -81,6 +85,7 @@ interface AccountTableProps {
     /** 拖拽排序回调，当用户完成拖拽时触发 */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
+    quotaWindow?: '5h' | 'weekly';
 }
 
 interface SortableRowProps {
@@ -101,6 +106,8 @@ interface SortableRowProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    quotaWindow?: '5h' | 'weekly';
+    isDragDisabled?: boolean;
 }
 
 interface AccountRowContentProps {
@@ -119,6 +126,7 @@ interface AccountRowContentProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    quotaWindow?: '5h' | 'weekly';
 }
 
 // ============================================================================
@@ -151,6 +159,42 @@ function isModelProtected(protectedModels: string[] | undefined, modelName: stri
     return protectionKey ? protectedModels.includes(protectionKey) : false;
 }
 
+/**
+ * 提取账号的最快配额重置时间（毫秒时间戳）
+ * 用于表格排序
+ */
+function extractAccountResetTime(account: Account, quotaWindow?: '5h' | 'weekly'): number | null {
+    let earliestTime: number | null = null;
+
+    if (quotaWindow === 'weekly') {
+        const groups = account.quota?.quota_groups || [];
+        for (const group of groups) {
+            for (const bucket of group.buckets || []) {
+                const isWeekly = bucket.window.toLowerCase().includes('week') || bucket.bucket_id.toLowerCase().includes('week');
+                if (isWeekly && bucket.reset_time) {
+                    const t = new Date(bucket.reset_time).getTime();
+                    if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
+                        earliestTime = t;
+                    }
+                }
+            }
+        }
+    } else {
+        // 5h 或常规视图下，从 models 中获取最近的 reset_time
+        const models = account.quota?.models || [];
+        for (const model of models) {
+            if (model.reset_time) {
+                const t = new Date(model.reset_time).getTime();
+                if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
+                    earliestTime = t;
+                }
+            }
+        }
+    }
+
+    return earliestTime;
+}
+
 // ============================================================================
 // 子组件
 // ============================================================================
@@ -177,6 +221,8 @@ function SortableAccountRow({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    quotaWindow,
+    isDragDisabled = false,
 }: SortableRowProps) {
     const { t } = useTranslation();
     const {
@@ -186,7 +232,7 @@ function SortableAccountRow({
         transform,
         transition,
         isDragging: isSortableDragging,
-    } = useSortable({ id: account.id });
+    } = useSortable({ id: account.id, disabled: isDragDisabled });
 
     const style = {
         transform: CSS.Transform.toString(transform),
@@ -209,10 +255,15 @@ function SortableAccountRow({
             {/* 拖拽手柄 */}
             <td className="pl-2 py-1 w-8 align-middle">
                 <div
-                    {...attributes}
-                    {...listeners}
-                    className="flex items-center justify-center w-6 h-6 cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-                    title={t('accounts.drag_to_reorder')}
+                    {...(!isDragDisabled ? attributes : {})}
+                    {...(!isDragDisabled ? listeners : {})}
+                    className={cn(
+                        "flex items-center justify-center w-6 h-6 rounded transition-colors",
+                        isDragDisabled
+                            ? "text-gray-200 dark:text-gray-700 cursor-not-allowed opacity-40"
+                            : "cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+                    )}
+                    title={isDragDisabled ? t('accounts.drag_disabled_during_sort', '已激活列排序，拖拽排序已暂停') : t('accounts.drag_to_reorder')}
                 >
                     <GripVertical className="w-4 h-4" />
                 </div>
@@ -221,10 +272,10 @@ function SortableAccountRow({
             <td className="px-2 py-1 w-10 align-middle">
                 <input
                     type="checkbox"
-                    className="checkbox checkbox-xs rounded border-2 border-gray-400 dark:border-gray-500 checked:border-blue-600 checked:bg-blue-600 [--chkbg:theme(colors.blue.600)] [--chkfg:white]"
+                    className="checkbox checkbox-sm rounded border-2 border-gray-400 dark:border-gray-500 checked:border-blue-600 checked:bg-blue-600 [--chkbg:theme(colors.blue.600)] [--chkfg:white]"
                     checked={selected}
                     onChange={onSelect}
-                    onClick={(e) => e.stopPropagation()}
+                    disabled={isRefreshing}
                 />
             </td>
             <AccountRowContent
@@ -243,6 +294,7 @@ function SortableAccountRow({
                 onWarmup={onWarmup}
                 onUpdateLabel={onUpdateLabel}
                 onViewError={onViewError}
+                quotaWindow={quotaWindow}
             />
         </tr>
     );
@@ -268,6 +320,7 @@ function AccountRowContent({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    quotaWindow,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
@@ -297,7 +350,27 @@ function AccountRowContent({
         }
     };
 
-    // 使用统一的模型配置
+    // 解析周配额项 (当处于 weekly 视图时)
+    const weeklyItems = useMemo(() => {
+        if (quotaWindow !== 'weekly') return [];
+        return (account.quota?.quota_groups || []).flatMap(group => {
+            return (group.buckets || [])
+                .filter(b => b.window.toLowerCase().includes('week') || b.bucket_id.toLowerCase().includes('week'))
+                .map(b => {
+                    const shortGroupName = (group.display_name || '')
+                        .replace(/ models?$/i, '')
+                        .replace(/Claude and GPT/i, 'Claude/GPT');
+                    return {
+                        id: `${group.display_name}-${b.bucket_id}`,
+                        label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (周)`,
+                        percentage: Math.round((b.remaining_fraction || 0) * 100),
+                        resetTime: b.reset_time,
+                        cycleTokens: b.cycle_tokens,
+                        Icon: shortGroupName.toLowerCase().includes('claude') ? Sparkles : Bot,
+                    };
+                });
+        });
+    }, [quotaWindow, account.quota?.quota_groups]);
 
     // 获取要显示的模型列表
     const pinnedModels = ensurePinnedImageSelector(
@@ -411,16 +484,16 @@ function AccountRowContent({
 
 
                         {/* 订阅类型徽章 */}
-                        {account.quota?.subscription_tier && (() => {
-                            const tier = account.quota.subscription_tier.toLowerCase();
-                            if (tier.includes('ultra')) {
+                        {(() => {
+                            const tier = getAccountTier(account);
+                            if (tier === 'ultra') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Gem className="w-2.5 h-2.5 fill-current" />
                                         {t('accounts.ultra')}
                                     </span>
                                 );
-                            } else if (tier.includes('pro')) {
+                            } else if (tier === 'pro') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Diamond className="w-2.5 h-2.5 fill-current" />
@@ -437,6 +510,9 @@ function AccountRowContent({
                             }
                         })()}
                         {/* 自定义标签 */}
+                        <span className="px-2 py-0.5 rounded-md bg-gray-100 dark:bg-base-300 text-gray-500 dark:text-gray-400 text-[10px] font-bold" title={t('accounts.priority_hint')}>
+                            {t('accounts.priority')}: {account.priority ?? 50}
+                        </span>
                         {account.custom_label && !isEditingLabel && (
                             <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[10px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
                                 <Tag className="w-2.5 h-2.5" />
@@ -509,23 +585,38 @@ function AccountRowContent({
                 ) : (
                     <div className={cn(
                         "grid gap-x-2 gap-y-1 py-0",
-                        displayModels.length === 1 ? "grid-cols-1" : "grid-cols-2"
+                        (quotaWindow === 'weekly' && weeklyItems.length > 0)
+                            ? (weeklyItems.length === 1 ? "grid-cols-1" : "grid-cols-2")
+                            : (displayModels.length === 1 ? "grid-cols-1" : "grid-cols-2")
                     )}>
-                        {displayModels.map((model) => {
-                            const modelData = model.data;
-
-                            return (
+                        {quotaWindow === 'weekly' && weeklyItems.length > 0 ? (
+                            weeklyItems.map((item) => (
                                 <QuotaItem
-                                    key={model.id}
-                                    label={model.label}
-                                    percentage={modelData?.percentage || 0}
-                                    resetTime={modelData?.reset_time}
-                                    isProtected={isModelProtected(account.protected_models, model.protectedKey)}
-                                    liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
-                                    Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
+                                    key={item.id}
+                                    label={item.label}
+                                    percentage={item.percentage}
+                                    resetTime={item.resetTime}
+                                    weeklyTokens={item.cycleTokens ?? null}
+                                    Icon={item.Icon}
                                 />
-                            );
-                        })}
+                            ))
+                        ) : (
+                            displayModels.map((model) => {
+                                const modelData = model.data;
+                                const display = getModelQuotaDisplay(model.id, modelData, account.quota?.quota_groups);
+
+                                return (
+                                    <QuotaItem
+                                        key={model.id}
+                                        label={model.label}
+                                        {...display}
+                                        isProtected={Boolean(config?.quota_protection?.enabled && isModelProtected(account.protected_models, model.protectedKey))}
+                                        liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
+                                        Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
+                                    />
+                                );
+                            })
+                        )}
                     </div>
                 )}
             </td>
@@ -583,7 +674,7 @@ function AccountRowContent({
                     )}
                     <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch(); }}
+                        onClick={(e) => { e.stopPropagation(); onSwitch('classic'); }}
                         title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', '切换到 Antigravity (经典版)'))}
                         disabled={isSwitching || isDisabled}
                     >
@@ -686,11 +777,61 @@ function AccountTable({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    quotaWindow,
 }: AccountTableProps) {
     const { t } = useTranslation();
 
     const [activeId, setActiveId] = useState<string | null>(null);
-    // showAllQuotas 已经在 useConfigStore 中解构获取
+    // 排序状态配置: 支持按配额重置时间 (reset_time) 或最后使用时间 (last_used) 排序
+    const [sortConfig, setSortConfig] = useState<{
+        key: 'reset_time' | 'last_used' | null;
+        direction: 'asc' | 'desc' | null;
+    }>({
+        key: null,
+        direction: null,
+    });
+
+    const isSortingActive = sortConfig.key !== null && sortConfig.direction !== null;
+
+    const handleSortToggle = (key: 'reset_time' | 'last_used') => {
+        setSortConfig(prev => {
+            if (prev.key !== key) {
+                return { key, direction: 'asc' };
+            }
+            if (prev.direction === 'asc') {
+                return { key, direction: 'desc' };
+            }
+            return { key: null, direction: null };
+        });
+    };
+
+    // 根据排序状态对 accounts 进行拦截排序
+    const sortedAccounts = useMemo(() => {
+        if (!isSortingActive) return accounts;
+
+        return [...accounts].sort((a, b) => {
+            if (sortConfig.key === 'reset_time') {
+                const timeA = extractAccountResetTime(a, quotaWindow);
+                const timeB = extractAccountResetTime(b, quotaWindow);
+
+                // 没有 reset_time 的排到后面
+                if (timeA === null && timeB === null) return 0;
+                if (timeA === null) return 1;
+                if (timeB === null) return -1;
+
+                return sortConfig.direction === 'asc' ? timeA - timeB : timeB - timeA;
+            }
+
+            if (sortConfig.key === 'last_used') {
+                const timeA = a.last_used || 0;
+                const timeB = b.last_used || 0;
+
+                return sortConfig.direction === 'asc' ? timeA - timeB : timeB - timeA;
+            }
+
+            return 0;
+        });
+    }, [accounts, sortConfig, quotaWindow, isSortingActive]);
 
     // 配置拖拽传感器
     const sensors = useSensors(
@@ -702,16 +843,19 @@ function AccountTable({
         })
     );
 
-    const accountIds = useMemo(() => accounts.map(a => a.id), [accounts]);
-    const activeAccount = useMemo(() => accounts.find(a => a.id === activeId), [accounts, activeId]);
+    const accountIds = useMemo(() => sortedAccounts.map(a => a.id), [sortedAccounts]);
+    const activeAccount = useMemo(() => sortedAccounts.find(a => a.id === activeId), [sortedAccounts, activeId]);
 
     const handleDragStart = (event: DragStartEvent) => {
+        if (isSortingActive) return;
         setActiveId(event.active.id as string);
     };
 
     const handleDragEnd = (event: DragEndEvent) => {
         const { active, over } = event;
         setActiveId(null);
+
+        if (isSortingActive) return;
 
         if (over && active.id !== over.id) {
             const oldIndex = accountIds.indexOf(active.id as string);
@@ -756,15 +900,47 @@ function AccountTable({
                             </th>
                             <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[300px] whitespace-nowrap">{t('accounts.table.email')}</th>
                             <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider min-w-[340px] whitespace-nowrap">
-                                {t('accounts.table.quota')}
+                                <button
+                                    type="button"
+                                    onClick={() => handleSortToggle('reset_time')}
+                                    className={cn(
+                                        "inline-flex items-center gap-1 hover:text-blue-600 dark:hover:text-blue-400 transition-colors uppercase font-medium",
+                                        sortConfig.key === 'reset_time' && "text-blue-600 dark:text-blue-400 font-semibold"
+                                    )}
+                                    title={t('accounts.table.sort_by_reset_time', '点击按配额重置时间排序')}
+                                >
+                                    <span>{quotaWindow === 'weekly' ? t('accounts.table.weekly_quota', '周配额') : t('accounts.table.quota')}</span>
+                                    {sortConfig.key === 'reset_time' ? (
+                                        sortConfig.direction === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> : <ArrowDown className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                                    ) : (
+                                        <ArrowUpDown className="w-3 h-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 opacity-60 hover:opacity-100" />
+                                    )}
+                                </button>
                             </th>
-                            <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[90px] whitespace-nowrap">{t('accounts.table.last_used')}</th>
+                            <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[90px] whitespace-nowrap">
+                                <button
+                                    type="button"
+                                    onClick={() => handleSortToggle('last_used')}
+                                    className={cn(
+                                        "inline-flex items-center gap-1 hover:text-blue-600 dark:hover:text-blue-400 transition-colors uppercase font-medium",
+                                        sortConfig.key === 'last_used' && "text-blue-600 dark:text-blue-400 font-semibold"
+                                    )}
+                                    title={t('accounts.table.sort_by_last_used', '点击按最后使用时间排序')}
+                                >
+                                    <span>{t('accounts.table.last_used')}</span>
+                                    {sortConfig.key === 'last_used' ? (
+                                        sortConfig.direction === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> : <ArrowDown className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                                    ) : (
+                                        <ArrowUpDown className="w-3 h-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 opacity-60 hover:opacity-100" />
+                                    )}
+                                </button>
+                            </th>
                             <th className="px-2 py-1 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider whitespace-nowrap sticky right-0 w-[220px] bg-gray-50 dark:bg-base-200 z-20 shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.1)] dark:shadow-[-12px_0_12px_-12px_rgba(255,255,255,0.05)] text-center">{t('accounts.table.actions')}</th>
                         </tr >
                     </thead >
                     <SortableContext items={accountIds} strategy={verticalListSortingStrategy}>
                         <tbody className="divide-y divide-gray-100 dark:divide-base-200">
-                            {accounts.map((account) => (
+                            {sortedAccounts.map((account) => (
                                 <SortableAccountRow
                                     key={account.id}
                                     account={account}
@@ -784,6 +960,8 @@ function AccountTable({
                                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
                                     onViewError={() => onViewError(account.id)}
+                                    quotaWindow={quotaWindow}
+                                    isDragDisabled={isSortingActive}
                                 />
                             ))}
                         </tbody>
@@ -825,6 +1003,7 @@ function AccountTable({
                                         onToggleProxy={() => { }}
                                         isDisabled={Boolean(activeAccount.disabled)}
                                         onViewError={() => { }}
+                                        quotaWindow={quotaWindow}
                                     />
                                 </tr>
                             </tbody>

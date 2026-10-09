@@ -20,13 +20,35 @@ export interface ModelDisplayNameInput {
     display_name?: string;
 }
 
+const DEFAULT_MODEL_LABELS: Record<string, string> = {
+    'gemini-pro-agent': 'gemini-3.1-pro-high',
+    'gemini-3.1-pro-high': 'gemini-3.1-pro-high',
+    'gemini-3.1-pro': 'gemini-3.1-pro',
+    'gemini-3.1-pro-low': 'gemini-3.1-pro-low',
+    'gemini-2.5-pro': 'gemini-2.5-pro',
+    'gemini-3.8-flash': 'gemini-3.8-flash',
+    'gemini-3.7-flash': 'gemini-3.7-flash',
+    'gemini-3.5-flash': 'gemini-3.5-flash',
+    'gemini-3-flash': 'gemini-3-flash',
+    'gemini-2.5-flash': 'gemini-2.5-flash',
+    'gemini-3.1-flash-lite': 'gemini-3.1-flash-lite',
+    'gemini-3.1-flash-image': 'gemini-3.1-flash-image',
+    'gemini-3-pro-image': 'gemini-3-pro-image',
+    'claude-sonnet-4-6': 'claude-sonnet-4-6',
+    'claude-opus-4-6-thinking': 'claude-opus-4-6-thinking',
+    'claude-sonnet-4-5': 'claude-sonnet-4-5',
+    'claude-haiku-4-5': 'claude-haiku-4-5',
+};
+
 export function getModelDisplayName(
     model: ModelDisplayNameInput | null | undefined,
     fallback?: string,
 ): string {
     if (model) {
+        if (model.name) {
+            return DEFAULT_MODEL_LABELS[model.name] || model.name;
+        }
         if (model.display_name) return model.display_name;
-        if (model.name) return model.name;
     }
     return fallback ?? '';
 }
@@ -40,8 +62,8 @@ export function findQuotaModel<T extends { name: string }>(
 ): T | undefined {
     if (!models || models.length === 0) return undefined;
     const preferred: Partial<Record<ModelCategory, string[]>> = {
-        'gemini-pro': ['gemini-pro-agent', 'gemini-3.1-pro-high', 'gemini-3.1-pro', 'gemini-3.1-pro-low', 'gemini-2.5-pro'],
-        'gemini-flash': ['gemini-3-flash-agent', 'gemini-3-flash', 'gemini-3.5-flash'],
+        'gemini-pro': ['gemini-pro-agent', 'gemini-3.1-pro-high', 'gemini-3.1-pro', 'gemini-3.1-pro-low'],
+        'gemini-flash': ['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3-flash-agent', 'gemini-3-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'],
         'claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking'],
     };
     const names = preferred[category];
@@ -111,6 +133,20 @@ export function resolveQuotaModels<T extends { name: string }>(
         const category = categorizeModel(normalizedId);
 
         const isImage = category === 'gemini-pro-image' || category === 'gemini-flash-image';
+
+        // Exact-match first: a pinned id that names a real quota model must render
+        // that model, not collapse into its category slot.
+        const exact = !isImage
+            ? models?.find(m => m.name.trim().toLowerCase() === normalizedId)
+            : undefined;
+        if (exact) {
+            const selectionKey = `model:${normalizedId}`;
+            if (seen.has(selectionKey)) continue;
+            seen.add(selectionKey);
+            results.push({ selectorId, selectionKey, model: exact });
+            continue;
+        }
+
         const selectionKey = isImage
             ? 'category:gemini-image'
             : category === 'other'

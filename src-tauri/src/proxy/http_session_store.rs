@@ -5,7 +5,7 @@
 use crate::proxy::handlers::openai::get_cached_tool_call;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -23,8 +23,32 @@ pub struct HttpSessionEntry {
     pub last_accessed: Instant,
 }
 
+#[derive(Debug)]
+struct SessionNode {
+    parent: Option<Arc<SessionNode>>,
+    input_delta: Vec<Value>,
+    response_output: Vec<Value>,
+    instructions: String,
+    model: String,
+    routing_session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionParent(Arc<SessionNode>);
+
+impl SessionParent {
+    pub fn routing_session_id(&self) -> &str {
+        &self.0.routing_session_id
+    }
+}
+
+struct StoredSession {
+    node: Arc<SessionNode>,
+    last_accessed: Instant,
+}
+
 struct HttpSessionStore {
-    sessions: HashMap<String, HttpSessionEntry>,
+    sessions: HashMap<String, StoredSession>,
 }
 
 impl HttpSessionStore {
@@ -34,22 +58,87 @@ impl HttpSessionStore {
         }
     }
 
-    fn get(&mut self, response_id: &str) -> Option<HttpSessionEntry> {
-        let entry = self.sessions.get_mut(response_id)?;
-        entry.last_accessed = Instant::now();
-        Some(entry.clone())
+    fn get(&mut self, response_id: &str) -> Option<(HttpSessionEntry, SessionParent)> {
+        let stored = self.sessions.get_mut(response_id)?;
+        stored.last_accessed = Instant::now();
+        let node = stored.node.clone();
+        Some((
+            HttpSessionEntry {
+                input_items: materialize_history(&node),
+                instructions: node.instructions.clone(),
+                model: node.model.clone(),
+                last_accessed: stored.last_accessed,
+            },
+            SessionParent(node),
+        ))
     }
 
     fn insert(&mut self, response_id: String, entry: HttpSessionEntry) {
-        self.sessions.insert(response_id, entry);
+        self.insert_delta(
+            response_id,
+            None,
+            entry.input_items,
+            Vec::new(),
+            entry.instructions,
+            entry.model,
+            None,
+        );
+    }
+
+    fn insert_delta(
+        &mut self,
+        response_id: String,
+        parent: Option<SessionParent>,
+        input_delta: Vec<Value>,
+        response_output: Vec<Value>,
+        instructions: String,
+        model: String,
+        routing_session_id: Option<String>,
+    ) {
+        let routing_session_id = routing_session_id.unwrap_or_else(|| response_id.clone());
+        self.sessions.insert(
+            response_id,
+            StoredSession {
+                node: Arc::new(SessionNode {
+                    parent: parent.map(|parent| parent.0),
+                    input_delta,
+                    response_output,
+                    instructions,
+                    model,
+                    routing_session_id,
+                }),
+                last_accessed: Instant::now(),
+            },
+        );
         // 顺便淘汰过期 session（惰性清理）
         self.evict_expired();
     }
 
     fn evict_expired(&mut self) {
         let ttl = Duration::from_secs(SESSION_TTL_SECS);
-        self.sessions.retain(|_, v| v.last_accessed.elapsed() < ttl);
+        self.sessions
+            .retain(|_, stored| stored.last_accessed.elapsed() < ttl);
     }
+}
+
+fn materialize_history(node: &Arc<SessionNode>) -> Vec<Value> {
+    let mut chain = Vec::new();
+    let mut current = Some(node.clone());
+    while let Some(node) = current {
+        chain.push(node.clone());
+        current = node.parent.clone();
+    }
+
+    let capacity = chain
+        .iter()
+        .map(|node| node.input_delta.len() + node.response_output.len())
+        .sum();
+    let mut history = Vec::with_capacity(capacity);
+    for node in chain.into_iter().rev() {
+        history.extend(node.input_delta.iter().cloned());
+        history.extend(node.response_output.iter().cloned());
+    }
+    history
 }
 
 static STORE: OnceLock<Mutex<HttpSessionStore>> = OnceLock::new();
@@ -60,6 +149,16 @@ fn store() -> &'static Mutex<HttpSessionStore> {
 
 /// 根据 previous_response_id 查找历史会话
 pub async fn get_session(previous_response_id: &str) -> Option<HttpSessionEntry> {
+    store()
+        .lock()
+        .await
+        .get(previous_response_id)
+        .map(|(entry, _)| entry)
+}
+
+pub async fn get_session_with_parent(
+    previous_response_id: &str,
+) -> Option<(HttpSessionEntry, SessionParent)> {
     store().lock().await.get(previous_response_id)
 }
 
@@ -68,10 +167,154 @@ pub async fn save_session(response_id: String, entry: HttpSessionEntry) {
     store().lock().await.insert(response_id, entry);
 }
 
-/// 追加本轮模型输出项到会话历史中
-pub async fn append_outputs(response_id: &str, new_outputs: Vec<Value>) {
-    if let Some(entry) = store().lock().await.sessions.get_mut(response_id) {
-        entry.input_items.extend(new_outputs);
+/// 保存 Responses 本轮增量；父节点的 Arc 强引用保证分支共享祖先。
+pub async fn save_session_delta(
+    response_id: String,
+    parent: Option<SessionParent>,
+    input_delta: Vec<Value>,
+    response_output: Vec<Value>,
+    instructions: String,
+    model: String,
+    routing_session_id: String,
+) {
+    store().lock().await.insert_delta(
+        response_id,
+        parent,
+        input_delta,
+        response_output,
+        instructions,
+        model,
+        Some(routing_session_id),
+    );
+}
+
+pub struct PreparedSessionInput {
+    pub merged: Vec<Value>,
+    pub delta: Vec<Value>,
+    pub reset_parent: bool,
+}
+
+/// 合并请求历史，并在客户端回放完整历史时仅提取新增项。
+pub fn prepare_session_input(
+    history: Vec<Value>,
+    new_input: Vec<Value>,
+    tool_call_cache: &HashMap<String, Value>,
+) -> PreparedSessionInput {
+    prepare_session_input_with_storage(history, new_input, tool_call_cache, true)
+}
+
+/// Restore the complete model input while optionally retaining a delta for storage.
+pub fn prepare_session_input_with_storage(
+    history: Vec<Value>,
+    new_input: Vec<Value>,
+    tool_call_cache: &HashMap<String, Value>,
+    retain_delta: bool,
+) -> PreparedSessionInput {
+    let reset_parent = new_input.iter().any(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("compaction") | Some("compaction_summary")
+        )
+    });
+    let exact_replay = !history.is_empty() && new_input.starts_with(&history);
+    let replayed_through = if reset_parent || exact_replay {
+        None
+    } else {
+        let history_ids: std::collections::HashSet<&str> = history
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .filter(|id| !id.is_empty())
+            .collect();
+        new_input.iter().rposition(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| history_ids.contains(id))
+        })
+    };
+
+    // Helper: check if two input items are semantically equivalent (ignoring volatile fields like id)
+    let items_semantically_equal = |a: &Value, b: &Value| -> bool {
+        let role_a = a.get("role").and_then(Value::as_str);
+        let role_b = b.get("role").and_then(Value::as_str);
+        let type_a = a.get("type").and_then(Value::as_str);
+        let type_b = b.get("type").and_then(Value::as_str);
+        let content_a = a.get("content").or_else(|| a.get("text"));
+        let content_b = b.get("content").or_else(|| b.get("text"));
+        role_a == role_b && type_a == type_b && content_a == content_b
+    };
+
+    // Semantic prefix match: check if new_input starts with history semantically
+    let semantic_prefix_match = !history.is_empty()
+        && new_input.len() >= history.len()
+        && history
+            .iter()
+            .zip(new_input.iter())
+            .all(|(h, n)| items_semantically_equal(h, n));
+
+    // Semantic suffix find: find last item of history in new_input
+    let semantic_suffix_idx = if !history.is_empty()
+        && !reset_parent
+        && !exact_replay
+        && replayed_through.is_none()
+        && !semantic_prefix_match
+    {
+        let last_h = &history[history.len() - 1];
+        new_input
+            .iter()
+            .rposition(|n| items_semantically_equal(last_h, n))
+    } else {
+        None
+    };
+
+    let (delta_source, use_new_input_as_merged) = if reset_parent || history.is_empty() {
+        (new_input.clone(), false)
+    } else if exact_replay {
+        (new_input[history.len()..].to_vec(), false)
+    } else if semantic_prefix_match {
+        (new_input[history.len()..].to_vec(), false)
+    } else if let Some(index) = replayed_through {
+        (new_input[index + 1..].to_vec(), false)
+    } else if let Some(index) = semantic_suffix_idx {
+        (new_input[index + 1..].to_vec(), false)
+    } else if new_input.len() >= history.len() {
+        // [FIX #3382] Fallback protection:
+        // When the client sends full conversation history but formatting/IDs differed
+        // such that no boundary was identified, appending all of new_input to history
+        // would double the history (2x, 4x, ...). Instead, treat new_input as the authoritative
+        // current history, extracting the last element as delta.
+        tracing::warn!(
+            "[Session] Match failed but new_input (len: {}) >= history (len: {}). Preventing history duplication.",
+            new_input.len(),
+            history.len()
+        );
+        let delta_slice = if new_input.is_empty() {
+            Vec::new()
+        } else {
+            vec![new_input.last().unwrap().clone()]
+        };
+        (delta_slice, true)
+    } else {
+        (new_input.clone(), false)
+    };
+
+    let delta = merge_history_with_new_input(Vec::new(), &[], delta_source, tool_call_cache);
+    let stored_delta = if retain_delta {
+        delta.clone()
+    } else {
+        Vec::new()
+    };
+    let merged = if reset_parent || history.is_empty() {
+        delta
+    } else if use_new_input_as_merged {
+        merge_history_with_new_input(Vec::new(), &[], new_input, tool_call_cache)
+    } else {
+        merge_history_with_new_input(history, &[], delta, tool_call_cache)
+    };
+
+    PreparedSessionInput {
+        merged,
+        delta: stored_delta,
+        reset_parent,
     }
 }
 
@@ -81,7 +324,7 @@ pub async fn append_outputs(response_id: &str, new_outputs: Vec<Value>) {
 pub fn merge_history_with_new_input(
     mut history: Vec<Value>,
     response_output: &[Value],
-    new_input: &[Value],
+    new_input: Vec<Value>,
     tool_call_cache: &HashMap<String, Value>,
 ) -> Vec<Value> {
     // 检测新输入中是否包含 compaction / compaction_summary，如果包含，说明客户端正在发送压缩后的全新完整历史
@@ -102,7 +345,7 @@ pub fn merge_history_with_new_input(
             if t == "compaction" || t == "compaction_summary" {
                 continue;
             }
-            filtered.push(item.clone());
+            filtered.push(item);
         }
         repair_tool_calls(&mut filtered, tool_call_cache);
         return dedupe_input_items(filtered);
@@ -119,7 +362,7 @@ pub fn merge_history_with_new_input(
         if t == "compaction" || t == "compaction_summary" {
             continue;
         }
-        history.push(item.clone());
+        history.push(item);
     }
 
     // 修复工具调用（确保function_call_output前有对应的function_call）
@@ -217,4 +460,166 @@ fn dedupe_input_items(items: Vec<Value>) -> Vec<Value> {
         filtered.push(item);
     }
     filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(text: &str) -> HttpSessionEntry {
+        HttpSessionEntry {
+            input_items: vec![json!({
+                "id": format!("msg-{text}"),
+                "type": "message",
+                "role": "user",
+                "content": text
+            })],
+            instructions: "be concise".to_string(),
+            model: "gemini-3.7-flash-high".to_string(),
+            last_accessed: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn responses_store_false_restores_full_input_without_retaining_delta() {
+        let history = vec![
+            json!({"id": "old", "role": "user", "content": "x".repeat(32768)}),
+            json!({"id": "answer", "role": "assistant", "content": "prior answer"}),
+        ];
+        let next = json!({"id": "new", "role": "user", "content": "y".repeat(32768)});
+        let mut full_input = history.clone();
+        full_input.push(next.clone());
+        for replay in [vec![next], full_input.clone()] {
+            let prepared =
+                prepare_session_input_with_storage(history.clone(), replay, &HashMap::new(), false);
+            assert!(prepared.delta.is_empty());
+            assert_eq!(prepared.merged, full_input);
+        }
+        let prepared =
+            prepare_session_input_with_storage(Vec::new(), history.clone(), &HashMap::new(), false);
+        assert!(prepared.delta.is_empty());
+        assert_eq!(prepared.merged, history);
+    }
+
+    #[test]
+    fn responses_store_false_full_tool_replay_needs_no_global_cache() {
+        let call_id = format!("uncached-{}", uuid::Uuid::new_v4());
+        let input = vec![
+            json!({"id":"call-item", "type":"function_call", "call_id":call_id, "name":"shell_command", "arguments":"{\"command\":\"pwd\"}"}),
+            json!({"type":"function_call_output", "call_id":call_id, "output":"/synthetic/workspace"}),
+            json!({"role":"user", "content":"continue"}),
+        ];
+        assert!(get_cached_tool_call(&call_id).is_none());
+        let prepared =
+            prepare_session_input_with_storage(Vec::new(), input.clone(), &HashMap::new(), false);
+        assert!(prepared.delta.is_empty());
+        assert_eq!(prepared.merged, input);
+    }
+
+    #[test]
+    fn session_chain_stores_delta_and_materializes_history() {
+        let mut store = HttpSessionStore::new();
+        store.insert("resp-1".to_string(), entry("first"));
+        let (root, parent) = store.get("resp-1").expect("root");
+        let mut replay = root.input_items.clone();
+        replay.push(json!({"id": "msg-second", "content": "second"}));
+        let prepared = prepare_session_input(root.input_items, replay, &HashMap::new());
+        assert_eq!(prepared.delta.len(), 1);
+        assert_eq!(prepared.merged.len(), 2);
+        store.insert_delta(
+            "resp-2".to_string(),
+            Some(parent),
+            prepared.delta,
+            vec![json!({"id": "out-second", "content": "answer"})],
+            "be concise".to_string(),
+            "gemini-3.7-flash-high".to_string(),
+            Some("routing-root".to_string()),
+        );
+
+        let (previous, _) = store.get("resp-2").expect("child");
+        assert_eq!(previous.input_items[0]["content"], "first");
+        assert_eq!(previous.input_items.len(), 3);
+        assert_eq!(store.sessions["resp-2"].node.input_delta.len(), 1);
+        assert_eq!(store.sessions["resp-2"].node.response_output.len(), 1);
+    }
+
+    #[test]
+    fn old_response_id_branches_share_parent() {
+        let mut store = HttpSessionStore::new();
+        store.insert("resp-root".to_string(), entry("root"));
+        let (_, parent_a) = store.get("resp-root").expect("parent a");
+        let (_, parent_b) = store.get("resp-root").expect("parent b");
+        assert!(Arc::ptr_eq(&parent_a.0, &parent_b.0));
+
+        store.insert_delta(
+            "resp-a".to_string(),
+            Some(parent_a),
+            vec![json!({"content": "branch a"})],
+            Vec::new(),
+            String::new(),
+            String::new(),
+            Some("routing-root".to_string()),
+        );
+        store.insert_delta(
+            "resp-b".to_string(),
+            Some(parent_b),
+            vec![json!({"content": "branch b"})],
+            Vec::new(),
+            String::new(),
+            String::new(),
+            Some("routing-root".to_string()),
+        );
+
+        let parent_a = store.sessions["resp-a"].node.parent.as_ref().unwrap();
+        let parent_b = store.sessions["resp-b"].node.parent.as_ref().unwrap();
+        assert!(Arc::ptr_eq(parent_a, parent_b));
+        assert_eq!(
+            store.sessions["resp-a"].node.routing_session_id,
+            "routing-root"
+        );
+        assert_eq!(
+            store.sessions["resp-b"].node.routing_session_id,
+            "routing-root"
+        );
+    }
+
+    #[test]
+    fn prepare_session_input_prevents_duplication_on_full_history_replay_without_ids() {
+        // Test case when client resends full history without IDs:
+        // history has 2 messages, new_input has 3 messages (the same 2 + 1 new), but no "id" field.
+        let history = vec![
+            json!({"role": "user", "type": "message", "content": "hello"}),
+            json!({"role": "assistant", "type": "message", "content": "hi there"}),
+        ];
+        let new_input = vec![
+            json!({"role": "user", "type": "message", "content": "hello"}),
+            json!({"role": "assistant", "type": "message", "content": "hi there"}),
+            json!({"role": "user", "type": "message", "content": "next question"}),
+        ];
+
+        let prepared = prepare_session_input(history, new_input, &HashMap::new());
+        // Delta should be the 1 new message, not all 3 messages!
+        assert_eq!(prepared.delta.len(), 1);
+        assert_eq!(prepared.delta[0]["content"], "next question");
+        // Merged history should be 3 messages, NOT 5 (2 + 3)!
+        assert_eq!(prepared.merged.len(), 3);
+    }
+
+    #[test]
+    fn prepare_session_input_fallback_avoids_duplication_when_unmatched() {
+        let history = vec![
+            json!({"role": "user", "type": "message", "content": "msg 1"}),
+            json!({"role": "assistant", "type": "message", "content": "msg 2"}),
+        ];
+        // Client sends 2 different messages (length >= history)
+        let new_input = vec![
+            json!({"role": "user", "type": "message", "content": "different 1"}),
+            json!({"role": "assistant", "type": "message", "content": "different 2"}),
+        ];
+
+        let prepared = prepare_session_input(history, new_input, &HashMap::new());
+        // Should not duplicate to 4 items
+        assert_eq!(prepared.merged.len(), 2);
+    }
 }
